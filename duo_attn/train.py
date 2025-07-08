@@ -108,6 +108,8 @@ def train(
 
             seq_len = input_ids.shape[1]
             seq_parallel_chunk_size = seq_len // world_size
+            print("train_sq")
+            print(seq_len)
             seq_parallel_chunk_start = seq_parallel_chunk_size * rank
             seq_parallel_chunk_end = seq_parallel_chunk_start + seq_parallel_chunk_size
             position_ids = torch.arange(

@@ -6,6 +6,9 @@ import pandas as pd
 import json
 import glob
 import argparse
+import shutil
+import os
+import datetime  # 添加 datetime 模块
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -35,8 +38,16 @@ PRETRAINED_LEN = args.pretrained_len
 
 
 def main():
+    # 获取当前时间戳作为运行标识符
+    run_id = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+                
+    # 创建一个新的文件夹用于存储当前运行的结果
+    current_run_folder = os.path.join(FOLDER_PATH, f"run_{run_id}/")
+    os.makedirs(current_run_folder, exist_ok=True)
+
     # Path to the directory containing JSON results
     folder_path = FOLDER_PATH
+
     if "/" in folder_path:
         model_name = folder_path.split("/")[-2]
     else:
@@ -45,6 +56,11 @@ def main():
 
     # Using glob to find all json files in the directory
     json_files = glob.glob(f"{folder_path}*.json")
+    print(f"Found {len(json_files)} JSON files in {folder_path}")
+
+    if not json_files:
+        print("No JSON files found. Exiting.")
+        return
     # import ipdb; ipdb.set_trace()
 
     # List to hold the data
@@ -63,29 +79,72 @@ def main():
             expected_answer = (
                 "eat a sandwich and sit in Dolores Park on a sunny day.".lower().split()
             )
-            score = len(
-                set(model_response.split()).intersection(set(expected_answer))
-            ) / len(expected_answer)
-            # Appending to the list
-            data.append(
-                {
-                    "Document Depth": document_depth,
-                    "Context Length": context_length,
-                    "Score": score,
-                }
-            )
+            
+            # 确保model_response和needle存在
+            if model_response and needle:
+                # 检查 'context_length' 是否存在且不为 None
+                if context_length is not None:
+                    score = len(
+                        set(model_response.split()).intersection(set(expected_answer))
+                    ) / len(expected_answer)
+                    # Appending to the list
+                    data.append(
+                        {
+                            "Document Depth": document_depth,
+                            "Context Length": context_length,
+                            "Score": score,
+                        }
+                    )
+                    print(f"Added score: {score}")
+                else:
+                    print(f"'context_length' is missing or None in {file}. Skipping.")
+            else:
+                print(f"Missing 'model_response' or 'needle' in {file}. Skipping.")               
 
     # Creating a DataFrame
+    #df = pd.DataFrame(data)
+    #locations = list(df["Context Length"].unique())
+    #locations.sort()
+    # 创建仅包含当前运行测试数据的 DataFrame
     df = pd.DataFrame(data)
-    locations = list(df["Context Length"].unique())
-    locations.sort()
-    for li, l in enumerate(locations):
-        if l > PRETRAINED_LEN:
-            break
-    pretrained_len = li
+    print(f"DataFrame columns: {df.columns.tolist()}")
+    print(f"DataFrame size: {df.shape}")
+
+    # 确保 'Context Length' 列存在
+    if "Context Length" in df.columns:
+        locations = list(df["Context Length"].unique())
+        locations.sort()
+        print(f"Unique Context Lengths: {locations}")
+    else:
+        locations = []
+        print("Warning: 'Context Length' column is missing in DataFrame.")
+
+        # 计算 pretrained_len
+    if locations:
+        pretrained_len = 0  # 默认值
+        for li, l in enumerate(locations):
+            if l > PRETRAINED_LEN:
+                pretrained_len = li
+                break
+        else:
+            pretrained_len = len(locations)  # 如果没有长度超过 PRETRAINED_LEN
+        print(f"pretrained_len: {pretrained_len}")
+    else:
+        pretrained_len = 0
+        print("No 'Context Length' data available. Setting 'pretrained_len' to 0.")
+    #for li, l in enumerate(locations):
+    #    if l > PRETRAINED_LEN:
+    #        break
+    #pretrained_len = li
+
+        # 检查df是否为空，以避免除以零
+    if not df.empty:
+        overall_score = df["Score"].mean()
+    else:
+        overall_score = 0.0
 
     print(df.head())
-    print("Overall score %.3f" % df["Score"].mean())
+    print("Overall score %.3f" % overall_score)
 
     pivot_table = pd.pivot_table(
         df, values="Score", index=["Document Depth", "Context Length"], aggfunc="mean"
@@ -116,7 +175,7 @@ def main():
     # More aesthetics
     model_name_ = MODEL_NAME
     plt.title(
-        f'NIAH {model_name_} \n Overall Score: {df["Score"].mean():.3f}'
+        f'NIAH {model_name_} \n Overall Score: {overall_score:.3f}'
     )  # Adds a title
     plt.xlabel("Token Limit")  # X-axis label
     plt.ylabel("Depth Percent")  # Y-axis label
@@ -127,7 +186,9 @@ def main():
     # Add a vertical line at the desired column index
     plt.axvline(x=pretrained_len + 0.8, color="white", linestyle="--", linewidth=4)
 
-    save_path = "img/%s.png" % model_name
+    #save_path = "img/%s.png" % model_name
+    save_path = os.path.join("img", f"{model_name}.png")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     print("saving at %s" % save_path)
     plt.savefig(save_path, dpi=150)
 

@@ -1,8 +1,6 @@
 import os
 import json
 import argparse
-import sys
-import time
 import numpy as np
 
 from metrics import (
@@ -142,100 +140,91 @@ if __name__ == "__main__":
     scores = dict()
     
     # ===== 1. 路径验证与创建 =====
-    base_input_dir = "eval/LongBench/pred_e" if args.e else "eval/LongBench/pred"
-    input_dir = os.path.join(base_input_dir, args.model.replace("/", "_"))
-
     if args.results_path:
-        output_dir = args.results_path
+        path = args.results_path
+        os.makedirs(path, exist_ok=True)  # 确保路径存在
     else:
-        output_dir = os.path.join("eval/LongBench/results_head_dim", "results" if not args.e else "results_e")
+        base_dir = "pred_e" if args.e else "pred"  # 添加完整路径
+        path = os.path.join(base_dir, args.model)
+        os.makedirs(path, exist_ok=True)  # 自动创建目录
     
-    # 确保输出目录存在且可写
-    # 确保目录存在
-    os.makedirs(input_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"输入目录: {os.path.abspath(input_dir)}")
-    print(f"输出目录: {os.path.abspath(output_dir)}")
-
-    # ===== 2. 权限检查 =====
-    if not os.access(output_dir, os.W_OK):
-        print(f"错误: 目录 {output_dir} 无写入权限")
-        sys.exit(1)
-
- # ===== 文件处理 =====
+    print(f"结果存储路径: {os.path.abspath(path)}")
+    
+    # ===== 2. 增强文件遍历逻辑 =====
     try:
-        # 获取所有.jsonl文件
-        all_files = sorted([
-            f for f in os.listdir(input_dir) 
-            if f.endswith(".jsonl") and os.path.isfile(os.path.join(input_dir, f))
-        ])
+        all_files = [f for f in os.listdir(path) if f.endswith(".jsonl")]
+        all_files.sort()
+        print("待评估文件列表:", all_files)
         
         if not all_files:
-            raise FileNotFoundError(f"输入目录中没有找到任何.jsonl文件")
-
-        print("📄 待评估文件列表：", all_files)
-
-        # 处理每个文件
-        for filename in all_files:
-            file_path = os.path.join(input_dir, filename)
-            print(f"\n🔨 正在处理：{os.path.basename(file_path)}")
+            raise FileNotFoundError(f"目录 {path} 下无.jsonl文件")
             
-            # 读取数据
+    except FileNotFoundError as e:
+        print(f"致命错误: {str(e)}")
+        sys.exit(1)
+
+    # ===== 3. 带错误捕获的文件处理 =====
+    for filename in all_files:
+        file_path = os.path.join(path, filename)
+        print(f"\n{'='*30} 处理文件 {filename} {'='*30}")
+        
+        try:
+            # ==== 3.1 读取数据 ====
             predictions, answers, lengths = [], [], []
             all_classes = None
-            
             with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    data = json.loads(line)
-                    predictions.append(data["pred"])
-                    answers.append(data["answers"])
-                    if "length" in data:
-                        lengths.append(data["length"])
-                    if "all_classes" in data:  # 只保留最后一个
-                        all_classes = data["all_classes"]
-
-            # 数据集名称处理
-            dataset = os.path.splitext(filename)[0]
-            dataset = dataset.split("-")[0].replace("_e", "")
-            if "repobench" in dataset:
+                for line_idx, line in enumerate(f):
+                    try:
+                        data = json.loads(line)
+                        # ==== 关键字段检查 ====
+                        if "pred" not in data or "answers" not in data:
+                            print(f"行 {line_idx} 缺少必要字段，已跳过")
+                            continue
+                            
+                        predictions.append(data["pred"])
+                        answers.append(data.get("answers", []))
+                        if "length" in data:
+                            lengths.append(data["length"])
+                        if "all_classes" in data:
+                            all_classes = data["all_classes"]  # 保持最后一个值
+                            
+                    except json.JSONDecodeError as e:
+                        print(f"行 {line_idx} JSON解析失败: {str(e)}")
+                        continue
+                        
+            # ==== 3.2 空数据检查 ====
+            if not predictions:
+                print(f"警告: 文件 {filename} 无有效预测数据")
+                scores[filename] = 0.0
+                continue
+                
+            # ==== 3.3 数据集名称修正 ====
+            dataset = filename.split("-")[0].replace("_e", "")  # 处理LongBench-E后缀
+            if dataset == "repobench":
                 dataset = "repobench-p"
-
-            # 评分
+                
+            # ==== 3.4 执行评分 ====
             score = (
                 scorer_e(dataset, predictions, answers, lengths, all_classes)
                 if args.e
                 else scorer(dataset, predictions, answers, all_classes)
             )
             scores[filename] = score
-            print(f"✅ {filename} 评分完成：{score}")
+            print(f"评分完成: {filename} => {score}")
+            
+        except Exception as e:
+            print(f"处理文件 {filename} 时发生严重错误: {str(e)}")
+            scores[filename] = "ERROR"
+            continue
 
-    except Exception as e:
-        print(f"❌ 发生错误：{str(e)}")
-        sys.exit(1)
-
-    # ===== 结果写入 =====
-    out_path = os.path.join(output_dir, "result.json")
-    print(f"\n💾 正在保存结果到：{out_path}")
+    # ===== 4. 确保结果写入 =====
+    out_path = os.path.join(path, "result.json")
     
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(scores, f, ensure_ascii=False, indent=2)
-        print("🎉 结果保存成功！")
-    except Exception as e:
-        print(f"❌ 保存失败：{str(e)}")
-        # 应急写入
-        with open(out_path + ".bak", "w") as f:
-            json.dump({"error": str(e)}, f)
-
-    '''
-    with open(out_path, "w") as f:
-            json.dump(scores, f)
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(scores, f, ensure_ascii=False, indent=4)
         print(f"\n{'='*30} 结果已保存至 {out_path} {'='*30}")
         
     except IOError as e:
-         print(f"全局错误: {str(e)}")
-         with open(out_path, "w") as f:
-            json.dump({"error": str(e)}, f)'''
+        print(f"无法写入结果文件: {str(e)}")
+        sys.exit(1)

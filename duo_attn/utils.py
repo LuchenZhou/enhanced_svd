@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="kv_reduction")
 
     parser.add_argument(
-        "--model_name", type=str, default="/home/guangxuanx/models/LLaMA-2-7B-32K"
+        "--model_name", type=str, default="/home/xuezeyu/llm/duo-attention/models/Llama-2-7B-32K-Instruct"
     )
     parser.add_argument("--config_name", type=str, default=None)
 
@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument("--generation_length", type=int, default=256)
     parser.add_argument("--stride_length", type=int, default=256)
     parser.add_argument("--prefilling_chunk_size", type=int, default=4096)
+    
+    parser.add_argument("--use_svd", action="store_true", help="Enable SVD-compressed weight loading")
 
     parser.add_argument("--seed", type=int, default=42)
 

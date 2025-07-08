@@ -8,13 +8,14 @@ context_lengths_min=$4
 s_len=$5
 pretrained_len=$6
 model_provider=$7
+#additional_args=$8
 
 # cut the last part of the path of the attn_pattern to get the name
 attn_pattern_name=$(echo $attn_pattern | rev | cut -d'/' -f1 | rev)
 
 suffix="duo_attn-attn_pattern=${attn_pattern_name}-sparsity=${sparsity}"
 (
-    python -u needle_in_haystack.py --s_len $s_len \
+    python -u needle_in_haystack_ffn.py --s_len $s_len \
         --e_len $pretrained_len \
         --context_lengths_min $context_lengths_min \
         --context_lengths_max $pretrained_len \
@@ -28,7 +29,7 @@ suffix="duo_attn-attn_pattern=${attn_pattern_name}-sparsity=${sparsity}"
         --sink_size 64 \
         --recent_size 256 \
         --prefilling_chunk_size 32000 \
-        --model_path ../../models/${model}
+        --model_path ../../models/${model} 
 ) 2>&1 | tee logs/eval_${model}_${suffix}.log
 
 python visualize.py \

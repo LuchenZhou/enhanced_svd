@@ -67,7 +67,7 @@ class LLMNeedleHaystackTester:
         :param haystack_dir: The directory of text files to use as background context (or a haystack) in which the needle is to be found. Default is Paul Graham Essays.
         :param retrieval_question: The question which with to prompt the model to do the retrieval.
         :param results_version: In case you would like to try the same combination of model, context length, and depth % multiple times, change the results version other than 1
-        :param num_concurrent_requests: Due to volume, this object is set up to run concurrent requests, default = 1. Be careful of rate limits.
+        :param num_concurrent_requests: Due to volume, this object is set up to run concurrent reqfileduests, default = 1. Be careful of rate limits.
         :param save_results: Whether or not you would like to save your contexts to file. Warning: These will get long! Default = True
         :param save_contexts: Whether or not you would like to save your contexts to file. Warning: These will get long! Default is True.
         :param final_context_length_buffer: The amount of cushion you'd like to leave off the input context to allow for the output context. Default 200 tokens
@@ -83,7 +83,7 @@ class LLMNeedleHaystackTester:
         :param model_name: The name of the model. Default is 'gpt-4-1106-preview'.
         :param seconds_to_sleep_between_completions: The number of seconds to sleep between completions. Default is None.
         :param print_ongoing_status: Whether or not to print the ongoing status. Default is True.
-        :param svd_rank: The rank to use for SVD compression. Default is 1024.
+        :param svd_rank: The rank to use for SVD compression. Default is 256.
         :param disable_svd: Whether to disable SVD compression. Default is False.
         """
         if not needle or not haystack_dir or not retrieval_question:
@@ -241,75 +241,30 @@ class LLMNeedleHaystackTester:
     def compress_attention_weights(self):
         """
         对模型中的注意力层权重进行SVD压缩，并保存压缩后的权重。
-        为每个投影层分配不同的svd_rank，确保svd_rank > input_svd_rank且 < 75%原始维度。
         """
         print("Starting SVD compression of attention weights...")
-        
-        # 基础的SVD秩，可以根据需要调整
-        base_svd_rank = self.svd_rank if self.svd_rank is not None else 1024  # 默认值为1024
-        
         for name, module in self.model_to_test.named_modules():
-            # 检查模块是否包含注意力投影层
             if hasattr(module, 'q_proj') and hasattr(module, 'k_proj') and hasattr(module, 'v_proj') and hasattr(module, 'o_proj'):
                 for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                     weight = getattr(module, proj).weight.data
                     try:
-                        # 获取原始权重的形状
-                        dim1, dim2 = weight.shape
-                        
-                        # 计算每个投影层的svd_rank_max，确保它小于75% of max dimension
-                        svd_rank_max = int(0.75 * max(dim1, dim2))
-                        
-                        # 根据投影类型分配不同的svd_rank
-                        if proj in ['q_proj', 'k_proj', 'v_proj']:
-                            # 对于关键层，使用较高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 2, svd_rank_max)  # 例如2048
-                        elif proj == 'o_proj':
-                            # 对于o_proj，使用更高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 3, svd_rank_max)  # 例如3072
-                        else:
-                            current_svd_rank = min(base_svd_rank, svd_rank_max)
-                        
-                        # 进行SVD分解
+                        # 将权重转换为float32进行SVD
                         weight_float = weight.float()
+                        # 进行SVD分解
                         U, S, Vh = torch.linalg.svd(weight_float, full_matrices=False)
-                        
-                        # 计算总能量
-                        energy = torch.sum(S ** 2)
-                        cumulative_energy = torch.cumsum(S ** 2, dim=0)
-                        energy_threshold = 0.99 * energy
-                        
-                        # 选择rank，使得保留99%的能量
-                        rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
-                        
-                        # 设定压缩秩的上限
-                        rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 确保rank_to_use不低于基础svd_rank
-                        if rank_to_use < base_svd_rank:
-                            rank_to_use = base_svd_rank
-                            rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 截断SVD分解结果
-                        U_truncated = U[:, :rank_to_use]
-                        S_truncated = S[:rank_to_use]
-                        Vh_truncated = Vh[:rank_to_use, :]
-                        
-                        # 重构压缩后的权重矩阵
-                        compressed_weight = torch.mm(U_truncated, torch.diag(S_truncated)).mm(Vh_truncated)
-                        
-                        # 转换回原始的数据类型
+                        # 截断SVD
+                        U = U[:, :self.svd_rank]
+                        S = S[:self.svd_rank]
+                        Vh = Vh[:self.svd_rank, :]
+                        # 重构压缩后的权重
+                        compressed_weight = torch.mm(U, torch.diag(S)).mm(Vh)
+                        # 转换回BFloat16
                         compressed_weight = compressed_weight.to(weight.dtype)
-                        
                         # 替换原始权重
+                        #setattr(module, proj).weight.data = compressed_weight
+                        #setattr(module, proj, compressed_weight)  # 正确的用法
                         getattr(module, proj).weight.data = compressed_weight
-                        
-                        # 计算能量保留比例
-                        energy_retained = torch.sum(S_truncated ** 2).item() / energy.item()
-                        
-                        # 输出压缩信息
-                        print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}, rank={rank_to_use}, energy retained={energy_retained:.4f}")
-                    
+                        print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}")
                     except Exception as e:
                         print(f"Failed to compress {proj} for {name}: {e}")
 
@@ -342,12 +297,13 @@ class LLMNeedleHaystackTester:
 
     def run_test(self, args):
         # Run through each iteration of context_lengths and depths
-        tasks = []
         for context_length in self.context_lengths:
-            if context_length < args.s_len or context_length > args.e_len:
+            if args.s_len is not None and context_length < args.s_len:
+                continue
+            if args.e_len is not None and context_length > args.e_len:
                 continue
             for depth_percent in self.document_depth_percents:
-                task = self.bound_evaluate_and_log(context_length, depth_percent)
+                self.bound_evaluate_and_log(context_length, depth_percent)
 
     def generate_prompt(self, context):
         test_format = f"<|im_start|> This is a very long story book: <book> {context} </book>.\n\nQuestion: Based on the content of the book, {self.retrieval_question}"
@@ -357,6 +313,10 @@ class LLMNeedleHaystackTester:
         # Checks to see if you've already checked a length/percent/version.
         # This helps if the program stop running and you want to restart later
         if self.save_results:
+            #if self.result_exists(context_length, depth_percent):
+                #print("result exists, skipping")
+                #return
+            #else:
             print("result does not exist, testing")
 
         # Go generate the required length context and place your needle statement in
@@ -368,57 +328,92 @@ class LLMNeedleHaystackTester:
         test_start_time = time.time()
 
         # Simulate multiround conversation
-        prompt = self.enc(prompt, return_tensors="pt")
+        prompt_encoded = self.enc(prompt, return_tensors="pt")
 
-        prompt_input_ids = prompt["input_ids"].to(self.model_to_test.device)
+        prompt_input_ids = prompt_encoded["input_ids"].to(self.model_to_test.device)
 
         simulation_start_idx = prompt_input_ids.size(1) - self.simulation_length
+
+        if simulation_start_idx < 0:
+            simulation_start_idx = 0  # 防止负索引
 
         question_input_ids = prompt_input_ids[:, simulation_start_idx:]
         prompt_input_ids = prompt_input_ids[:, :simulation_start_idx]
 
+        generated_content = []
+        pred_token_idx = None  # 初始化
+
         with torch.no_grad():
-            if self.args.prefilling_chunk_size is not None:
+            if self.args.prefilling_chunk_size is not None and self.args.prefilling_chunk_size > 0:
                 past_key_values = None
-                for i in range(
-                    0, prompt_input_ids.size(1), self.args.prefilling_chunk_size
-                ):
+                for i in range(0, prompt_input_ids.size(1), self.args.prefilling_chunk_size):
                     chunk = prompt_input_ids[:, i : i + self.args.prefilling_chunk_size]
+                    try:
+                        output = self.model_to_test(
+                            input_ids=chunk,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
+                        past_key_values = output.past_key_values
+                        print(f"Prefilled chunk {i} to {i + self.args.prefilling_chunk_size}")
+                    except Exception as e:
+                        print(f"Error during prefilling: {e}")
+                        return
+            else:
+                try:
                     output = self.model_to_test(
-                        input_ids=chunk,
+                        input_ids=prompt_input_ids, past_key_values=None, use_cache=True
+                    )
+                    past_key_values = output.past_key_values
+                    print("Initial model pass completed.")
+                except Exception as e:
+                    print(f"Error during initial model pass: {e}")
+                    return
+
+            # 处理 question_input_ids
+            if question_input_ids.size(1) > 0:
+                for idx, input_id in enumerate(question_input_ids[0]):
+                    try:
+                        input_id_tensor = input_id.unsqueeze(0).unsqueeze(0)
+                        output = self.model_to_test(
+                            input_ids=input_id_tensor.to(self.model_to_test.device),
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
+                        past_key_values = output.past_key_values
+                        pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                        generated_content.append(pred_token_idx.item())
+                        print(f"Generated token {idx}: {pred_token_idx.item()}")
+                    except Exception as e:
+                        print(f"Error during token generation at position {idx}: {e}")
+                        break  # 退出循环
+
+            # 如果没有生成任何 token，初始化 pred_token_idx
+            if pred_token_idx is None and not question_input_ids.size(1) > 0:
+                print("No tokens to generate from question_input_ids, initializing pred_token_idx with EOS token.")
+                pred_token_idx = torch.tensor([[self.eos_token_ids[0]]], device=self.model_to_test.device)
+                generated_content.append(pred_token_idx.item())
+
+            # 生成后续 tokens
+            for _ in range(50):
+                try:
+                    outputs = self.model_to_test(
+                        input_ids=pred_token_idx.to(self.model_to_test.device),
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                    past_key_values = output.past_key_values
-            else:
-                output = self.model_to_test(
-                    input_ids=prompt_input_ids, past_key_values=None, use_cache=True
-                )
-                past_key_values = output.past_key_values
-
-            for input_id in question_input_ids[0]:
-                output = self.model_to_test(
-                    input_ids=input_id.unsqueeze(0).unsqueeze(0),
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = output.past_key_values
-
-            pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-            generated_content = [pred_token_idx.item()]
-            for _ in range(50):
-                outputs = self.model_to_test(
-                    input_ids=pred_token_idx,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-
-                past_key_values = outputs.past_key_values
-                pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                generated_content += [pred_token_idx.item()]
-                if pred_token_idx.item() in self.eos_token_ids:
+                    past_key_values = outputs.past_key_values
+                    pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                    generated_content.append(pred_token_idx.item())
+                    print(f"Generated token: {pred_token_idx.item()}")
+                    if pred_token_idx.item() in self.eos_token_ids:
+                        print("Encountered EOS token.")
+                        break
+                except Exception as e:
+                    print(f"Error during further token generation: {e}")
+                    error_occurred = True  # 设置错误标志
                     break
-
+        #if not error_occurred:            
         response = self.enc.decode(generated_content, skip_special_tokens=True).strip()
 
         test_end_time = time.time()
@@ -531,7 +526,7 @@ class LLMNeedleHaystackTester:
         tokens_needle = self.encode_text_to_tokens(self.needle)
         tokens_context = self.encode_text_to_tokens(context)
 
-        # Reducing the context length by 150 buffer. This is to account for system message, the user question, and response.
+        # Reducing the context length by final_context_length_buffer buffer. This is to account for system message, the user question, and response.
         context_length -= self.final_context_length_buffer
 
         # If your context + needle are longer than the context length (which it will be), then reduce tokens from the context by the needle length
@@ -638,7 +633,7 @@ if __name__ == "__main__":
     )
 
     # 新增SVD相关参数
-    parser.add_argument("--svd_rank", type=int, default=1024, help="SVD compression rank")
+    parser.add_argument("--svd_rank", type=int, default=256, help="SVD compression rank")
     parser.add_argument(
         "--disable_svd",
         action="store_true",
@@ -648,10 +643,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.model_path is not None:
-        assert args.model_name is None
+        assert args.model_name is None, "Specify either --model_path or --model_name, not both."
         model_name = args.model_path
     else:
-        assert args.model_name is not None
+        assert args.model_name is not None, "You must specify --model_name."
         model_name = args.model_name
 
     ht = LLMNeedleHaystackTester(

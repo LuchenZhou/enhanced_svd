@@ -7,7 +7,7 @@ python eval/efficiency/benchmark_static.py \
     --model_name models/${model_name} \
     --max_length $max_length \
     --attn_load_dir $attn_pattern \
-    --output_dir outputs/efficiency/${model_name}/gen_ctx=${max_length}_sparsity=${sparsity}_chunk_size=32000 \
+    --output_dir outputs/efficiency_base/${model_name}/gen_ctx=${max_length}_sparsity=${sparsity}_chunk_size=32000 \
     --seed 42 \
     --sparsity $sparsity \
     --prefilling_chunk_size 32000

@@ -258,15 +258,15 @@ class LLMNeedleHaystackTester:
                         dim1, dim2 = weight.shape
                         
                         # 计算每个投影层的svd_rank_max，确保它小于75% of max dimension
-                        svd_rank_max = int(0.75 * max(dim1, dim2))
+                        svd_rank_max = int(0.80 * max(dim1, dim2))
                         
                         # 根据投影类型分配不同的svd_rank
                         if proj in ['q_proj', 'k_proj', 'v_proj']:
                             # 对于关键层，使用较高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 2, svd_rank_max)  # 例如2048
+                            current_svd_rank = min(int(base_svd_rank * 3), svd_rank_max)  # 例如2048
                         elif proj == 'o_proj':
                             # 对于o_proj，使用更高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 3, svd_rank_max)  # 例如3072
+                            current_svd_rank = min(int(base_svd_rank * 3), svd_rank_max)  # 例如3072
                         else:
                             current_svd_rank = min(base_svd_rank, svd_rank_max)
                         

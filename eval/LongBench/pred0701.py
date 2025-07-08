@@ -263,72 +263,84 @@ def get_pred(
     
     return preds
 
-def compress_attention_weights_with_head_dim(model, base_svd_rank=1024, new_head_dim=112, energy_ratio=0.997):
+def compress_attention_weights(model, svd_rank=None):
     """
-    仅对 k_proj / v_proj 进行 head_dim 压缩；q_proj / o_proj 仅做低秩近似但不改变形状。
-    k/v 的输出维度为 num_kv_heads * new_head_dim。
+    对模型中的注意力层权重进行SVD压缩，并保存压缩后的权重。
+    为每个投影层分配不同的svd_rank，确保svd_rank > input_svd_rank且 < 75%原始维度。
     """
-    import torch.nn as nn
+    print("Starting SVD compression of attention weights...")
 
-    print(f"\n[INFO] 🔧 Compressing KV head_dim → {new_head_dim}...")
-
-    num_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-    target_out = num_kv_heads * new_head_dim
+    # 基础的SVD秩，可以根据需要调整
+    base_svd_rank = svd_rank if svd_rank is not None else 1024  # 默认值为1024
 
     for name, module in model.named_modules():
-        if not (hasattr(module, "q_proj") and hasattr(module, "k_proj")):
-            continue
+        # 检查模块是否包含注意力投影层
+        if hasattr(module, 'q_proj') and hasattr(module, 'k_proj') and hasattr(module, 'v_proj') and hasattr(module, 'o_proj'):
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                weight = getattr(module, proj).weight.data
+                try:
+                    # 获取原始权重的形状
+                    dim1, dim2 = weight.shape
 
-        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            weight: torch.Tensor = getattr(module, proj_name).weight.data
-            out_dim, in_dim = weight.shape
+                    # 计算每个投影层的svd_rank_max，确保它小于75%原始维度
+                    svd_rank_max = int(0.85 * max(dim1, dim2))
 
-            try:
-                svd_rank_max = int(0.9 * min(out_dim, in_dim))
-                target_rank = min(base_svd_rank, svd_rank_max)
+                    # 根据投影类型分配不同的svd_rank
+                    if proj in ['q_proj', 'k_proj', 'v_proj']:
+                        # 对于关键层，使用较高的svd_rank，确保保留更多信息
+                        current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如2048/3072
+                    elif proj == 'o_proj':
+                        # 对于o_proj，使用更高的svd_rank，确保保留更多信息
+                        current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如3072
+                    else:
+                        current_svd_rank = min(base_svd_rank, svd_rank_max)
 
-                U, S, Vh = torch.linalg.svd(weight.float(), full_matrices=False)
-                energy = torch.sum(S**2)
-                keep = (torch.cumsum(S**2, 0) < energy_ratio * energy).sum().item() + 1
-                keep = min(keep, target_rank)
-                U_r, S_r, Vh_r = U[:, :keep], S[:keep], Vh[:keep, :]
-            except RuntimeError as e:
-                print(f"[×] SVD failed on {name}.{proj_name}: {e}")
-                continue
+                    # 进行SVD分解
+                    weight_float = weight.float()
+                    U, S, Vh = torch.linalg.svd(weight_float, full_matrices=False)
 
-            if proj_name in ["k_proj", "v_proj"]:
-                new_w = (torch.diag(S_r) @ Vh_r).to(weight.dtype)  # [keep, in_dim]
+                    # 计算总能量
+                    energy = torch.sum(S ** 2)
+                    cumulative_energy = torch.cumsum(S ** 2, dim=0)
+                    energy_threshold = 0.997 * energy
 
-                if new_w.shape[0] >= target_out:
-                    new_w = new_w[:target_out, :].contiguous()
-                else:
-                    pad = torch.zeros(target_out - new_w.shape[0], in_dim,
-                                       dtype=new_w.dtype, device=new_w.device)
-                    new_w = torch.cat([new_w, pad], dim=0)
+                    # 选择rank，使得保留99%的能量
+                    rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
 
-                new_proj = nn.Linear(in_features=in_dim,
-                                     out_features=target_out,
-                                     bias=False,
-                                     dtype=new_w.dtype,
-                                     device=new_w.device)
-                new_proj.weight.data.copy_(new_w)
-                setattr(module, proj_name, new_proj)
-                print(f"✓ {name}.{proj_name}: {out_dim} → {target_out}")
-            else:
-                new_w = (U_r @ torch.diag(S_r) @ Vh_r).to(weight.dtype)
-                weight.copy_(new_w)
-                print(f"✓ {name}.{proj_name}: low-rank approx, shape保持")
+                    # 设定压缩秩的上限
+                    rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
 
-    model.config.head_dim = new_head_dim
-    model.config.hidden_size = model.config.num_attention_heads * new_head_dim
+                    # 确保rank_to_use不低于基础svd_rank
+                    if rank_to_use < base_svd_rank:
+                        rank_to_use = base_svd_rank
+                        rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
 
-    print("[✓] Head_dim compression (k/v) completed.")
+                    # 截断SVD分解结果
+                    U_truncated = U[:, :rank_to_use]
+                    S_truncated = S[:rank_to_use]
+                    Vh_truncated = Vh[:rank_to_use, :]
 
+                    # 重构压缩后的权重矩阵
+                    compressed_weight = torch.mm(U_truncated, torch.diag(S_truncated)).mm(Vh_truncated)
 
+                    # 转换回原始的数据类型
+                    compressed_weight = compressed_weight.to(weight.dtype)
+
+                    # 替换原始权重
+                    getattr(module, proj).weight.data = compressed_weight
+
+                    # 计算能量保留比例
+                    energy_retained = torch.sum(S_truncated ** 2).item() / energy.item()
+
+                    # 输出压缩信息
+                    print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}, rank={rank_to_use}, energy retained={energy_retained:.4f}")
+
+                except Exception as e:
+                    print(f"Failed to compress {proj} for {name}: {e}")
 
 # 保存压缩后的权重
 def save_compressed_weights(model, model_version):
-    save_dir = os.path.join("./svd_compressed_head", model_version)
+    save_dir = os.path.join("./svd_compressed", model_version)
     os.makedirs(save_dir, exist_ok=True)
     try:
         torch.save(model.state_dict(), os.path.join(save_dir, "compressed_model.pth"))
@@ -338,7 +350,7 @@ def save_compressed_weights(model, model_version):
 
 # 加载压缩后的权重
 def load_svd_compressed_weights(model, model_version):
-    compressed_path = os.path.join("./svd_compressed_head", model_version, "compressed_model.pth")
+    compressed_path = os.path.join("./svd_compressed", model_version, "compressed_model.pth")
     if os.path.exists(compressed_path):
         try:
             print(f"Loading compressed weights from {compressed_path}")
@@ -452,13 +464,7 @@ if __name__ == "__main__":
 
     # 如果选择进行 SVD 压缩
     if args.compress_svd:
-        target_head_dim = 112
-        compress_attention_weights_with_head_dim(
-            model,
-            base_svd_rank=args.svd_rank,
-            new_head_dim=112,
-            energy_ratio=0.997
-            )
+        compress_attention_weights(model, svd_rank=args.svd_rank)
         save_compressed_weights(model, model_name)
 
     max_length = model2maxlen[model_name]

@@ -17,6 +17,8 @@ scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
 from datetime import datetime, timezone
 import time
 import torch
+import torch.linalg as LA  # 新增导入
+import torch.nn as nn  # 新增导入
 from duo_attn.patch import enable_duo_attention_eval
 
 from duo_attn.utils import (
@@ -24,6 +26,40 @@ from duo_attn.utils import (
     load_attn_pattern,
     sparsify_attention_heads,
 )
+
+
+def svd_compress(weight_matrix, compression_ratio=0.5):
+    """
+    对权重矩阵进行 SVD 分解并返回压缩后的矩阵。
+
+    :param weight_matrix: 要压缩的权重矩阵 (Tensor)。
+    :param compression_ratio: 压缩比例 (0 < ratio <= 1)。
+    :return: 压缩后的权重矩阵。
+    """
+    # 确保权重矩阵在CPU上进行SVD分解
+    U, S, Vh = LA.svd(weight_matrix.cpu(), full_matrices=False)
+    # 计算保留的奇异值数量 p
+    p = max(1, int(compression_ratio * S.size(0)))
+    U_p = U[:, :p].to(weight_matrix.device, dtype=weight_matrix.dtype)
+    S_p = torch.diag(S[:p]).to(weight_matrix.device, dtype=weight_matrix.dtype)
+    Vh_p = Vh[:p, :].to(weight_matrix.device, dtype=weight_matrix.dtype)
+    compressed_weight = U_p @ S_p @ Vh_p
+    return compressed_weight
+
+
+def generate_rotation_matrix(weight_matrix, compression_ratio=0.5):
+    """
+    生成旋转矩阵 R 用于压缩 Q、K、V 权重。
+
+    :param weight_matrix: 要压缩的权重矩阵 (Tensor)。
+    :param compression_ratio: 压缩比例 (0 < ratio <= 1)。
+    :return: 旋转矩阵 R (Tensor)。
+    """
+    weight_matrix = weight_matrix.to(torch.float32)  # Cast to float32
+    U, S, Vh = LA.svd(weight_matrix.cpu(), full_matrices=False)
+    p = max(1, int(compression_ratio * S.size(0)))
+    R = Vh[:p, :].to(weight_matrix.device, dtype=weight_matrix.dtype)
+    return R
 
 
 class LLMNeedleHaystackTester:
@@ -59,32 +95,9 @@ class LLMNeedleHaystackTester:
         attn_load_dir=None,
         sparsity=0.5,
         simulation_length=50,
-        svd_rank=1024,  # 新增参数用于SVD压缩
-        disable_svd=False,  # 新增参数用于控制是否禁用SVD压缩
     ):
         """
-        :param needle: The needle to be found in the haystack. Default is None.
-        :param haystack_dir: The directory of text files to use as background context (or a haystack) in which the needle is to be found. Default is Paul Graham Essays.
-        :param retrieval_question: The question which with to prompt the model to do the retrieval.
-        :param results_version: In case you would like to try the same combination of model, context length, and depth % multiple times, change the results version other than 1
-        :param num_concurrent_requests: Due to volume, this object is set up to run concurrent requests, default = 1. Be careful of rate limits.
-        :param save_results: Whether or not you would like to save your contexts to file. Warning: These will get long! Default = True
-        :param save_contexts: Whether or not you would like to save your contexts to file. Warning: These will get long! Default is True.
-        :param final_context_length_buffer: The amount of cushion you'd like to leave off the input context to allow for the output context. Default 200 tokens
-        :param context_lengths_min: The minimum length of the context. Default is 1000.
-        :param context_lengths_max: The maximum length of the context. Default is 200000.
-        :param context_lengths_num_intervals: The number of intervals for the context length. Default is 35.
-        :param context_lengths: The lengths of the context. Default is None.
-        :param document_depth_percent_min: The minimum depth percent of the document. Default is 0.
-        :param document_depth_percent_max: The maximum depth percent of the document. Default is 100.
-        :param document_depth_percent_intervals: The number of intervals for the document depth percent. Default is 35.
-        :param document_depth_percents: The depth percentages of the document. Default is None.
-        :param document_depth_percent_interval_type: The type of interval for the document depth percent. Must be either 'linear' or 'sigmoid'. Default is 'linear'.
-        :param model_name: The name of the model. Default is 'gpt-4-1106-preview'.
-        :param seconds_to_sleep_between_completions: The number of seconds to sleep between completions. Default is None.
-        :param print_ongoing_status: Whether or not to print the ongoing status. Default is True.
-        :param svd_rank: The rank to use for SVD compression. Default is 1024.
-        :param disable_svd: Whether to disable SVD compression. Default is False.
+        Initialization parameters...
         """
         if not needle or not haystack_dir or not retrieval_question:
             raise ValueError(
@@ -119,7 +132,7 @@ class LLMNeedleHaystackTester:
                 or context_lengths_num_intervals is None
             ):
                 raise ValueError(
-                    "Either context_lengths_min, context_lengths_max, context_lengths_intervals need to be filled out OR the context_lengths_list needs to be supplied."
+                    "Either context_lengths_min, context_lengths_max, context_lengths_num_intervals need to be filled out OR the context_lengths_list needs to be supplied."
                 )
             else:
                 self.context_lengths = np.round(
@@ -184,11 +197,15 @@ class LLMNeedleHaystackTester:
                 self.enc.pad_token_id = 0
         print("Loading from %s" % model_name)
 
-        self.model_to_test = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="eager",
-        ).eval()
+        try:
+            self.model_to_test = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",  # 更正为 flash_attention_2
+                device_map="auto",  # 确保模型加载到GPU
+            ).eval()
+        except ValueError as e:
+            raise ValueError(f"Error loading model with FlashAttention: {e}")
 
         print(f"attn_load_dir: {attn_load_dir}")
 
@@ -213,6 +230,11 @@ class LLMNeedleHaystackTester:
                 recent_size,
             )
 
+        # 添加 SVD 压缩功能
+        if args.enable_svd:
+            print("Applying SVD compression to Q, K, V, Wl weights with sparsity =", args.sparsity)
+            self.apply_svd_compression(args.sparsity)
+
         # list all usable GPU devices using torch
         device_list = [i for i in range(torch.cuda.device_count())]
         self.model_to_test = to_device(self.model_to_test, device_list, enable_tp=True)
@@ -224,12 +246,50 @@ class LLMNeedleHaystackTester:
         self.simulation_length = simulation_length
         model_name = model_name.split("/")[-1]
 
-        # 初始化SVD相关参数
-        self.svd_rank = svd_rank
-        self.disable_svd = disable_svd
+    def apply_svd_compression(self, sparsity):
+        """
+        对模型中的 Q、K、V 和 Wl 权重进行 SVD 压缩。
 
-        if not self.disable_svd:
-            self.compress_attention_weights()
+        :param sparsity: 压缩比例 (0 < ratio <= 1)。
+        """
+        self.rotation_matrices = {}
+        for name, module in self.model_to_test.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
+                    original_weight = module.weight.data
+                    # 生成旋转矩阵 R
+                    R = self.generate_rotation_matrix(original_weight, compression_ratio=sparsity)
+                    self.rotation_matrices[name] = R
+                    # 压缩权重矩阵 Q, K, V
+                    compressed_weight = (original_weight.to(torch.float32)) @ (R.T.to(torch.float32))
+                    module.weight.data = compressed_weight
+                    print(f"Compressed {name} from {original_weight.shape} to {compressed_weight.shape}")
+                elif 'out_proj' in name or 'w_proj' in name or 'wl_proj' in name:
+                    original_weight = module.weight.data
+                    # 假设 Wl 需要与 V 共享同一个旋转矩阵
+                    if 'wl_proj' in name:
+                        # 找到对应的 V 层名称
+                        corresponding_v_name = name.replace('wl_proj', 'v_proj')
+                        R = self.rotation_matrices.get(corresponding_v_name, None)
+                        if R is not None:
+                            compressed_weight = original_weight @ R.T
+                            module.weight.data = compressed_weight
+                            print(f"Compressed {name} from {original_weight.shape} to {compressed_weight.shape}")
+        print("SVD compression applied to Q, K, V, Wl.")
+
+    def generate_rotation_matrix(self, weight_matrix, compression_ratio=0.5):
+        """
+        生成旋转矩阵 R 用于压缩 Q、K、V 权重。
+
+        :param weight_matrix: 要压缩的权重矩阵 (Tensor)。
+        :param compression_ratio: 压缩比例 (0 < ratio <= 1)。
+        :return: 旋转矩阵 R (Tensor)。
+        """
+        weight_matrix = weight_matrix.to(torch.float32)  # Cast to float32
+        U, S, Vh = LA.svd(weight_matrix.cpu(), full_matrices=False)
+        p = max(1, int(compression_ratio * S.size(0)))
+        R = Vh[:p, :].to(weight_matrix.device, dtype=weight_matrix.dtype)
+        return R
 
     def logistic(self, x, L=100, x0=50, k=0.1):
         if x == 0:
@@ -238,116 +298,16 @@ class LLMNeedleHaystackTester:
             return 100
         return np.round(L / (1 + np.exp(-k * (x - x0))), 3)
 
-    def compress_attention_weights(self):
-        """
-        对模型中的注意力层权重进行SVD压缩，并保存压缩后的权重。
-        为每个投影层分配不同的svd_rank，确保svd_rank > input_svd_rank且 < 75%原始维度。
-        """
-        print("Starting SVD compression of attention weights...")
-        
-        # 基础的SVD秩，可以根据需要调整
-        base_svd_rank = self.svd_rank if self.svd_rank is not None else 1024  # 默认值为1024
-        
-        for name, module in self.model_to_test.named_modules():
-            # 检查模块是否包含注意力投影层
-            if hasattr(module, 'q_proj') and hasattr(module, 'k_proj') and hasattr(module, 'v_proj') and hasattr(module, 'o_proj'):
-                for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                    weight = getattr(module, proj).weight.data
-                    try:
-                        # 获取原始权重的形状
-                        dim1, dim2 = weight.shape
-                        
-                        # 计算每个投影层的svd_rank_max，确保它小于75% of max dimension
-                        svd_rank_max = int(0.75 * max(dim1, dim2))
-                        
-                        # 根据投影类型分配不同的svd_rank
-                        if proj in ['q_proj', 'k_proj', 'v_proj']:
-                            # 对于关键层，使用较高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 2, svd_rank_max)  # 例如2048
-                        elif proj == 'o_proj':
-                            # 对于o_proj，使用更高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 3, svd_rank_max)  # 例如3072
-                        else:
-                            current_svd_rank = min(base_svd_rank, svd_rank_max)
-                        
-                        # 进行SVD分解
-                        weight_float = weight.float()
-                        U, S, Vh = torch.linalg.svd(weight_float, full_matrices=False)
-                        
-                        # 计算总能量
-                        energy = torch.sum(S ** 2)
-                        cumulative_energy = torch.cumsum(S ** 2, dim=0)
-                        energy_threshold = 0.99 * energy
-                        
-                        # 选择rank，使得保留99%的能量
-                        rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
-                        
-                        # 设定压缩秩的上限
-                        rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 确保rank_to_use不低于基础svd_rank
-                        if rank_to_use < base_svd_rank:
-                            rank_to_use = base_svd_rank
-                            rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 截断SVD分解结果
-                        U_truncated = U[:, :rank_to_use]
-                        S_truncated = S[:rank_to_use]
-                        Vh_truncated = Vh[:rank_to_use, :]
-                        
-                        # 重构压缩后的权重矩阵
-                        compressed_weight = torch.mm(U_truncated, torch.diag(S_truncated)).mm(Vh_truncated)
-                        
-                        # 转换回原始的数据类型
-                        compressed_weight = compressed_weight.to(weight.dtype)
-                        
-                        # 替换原始权重
-                        getattr(module, proj).weight.data = compressed_weight
-                        
-                        # 计算能量保留比例
-                        energy_retained = torch.sum(S_truncated ** 2).item() / energy.item()
-                        
-                        # 输出压缩信息
-                        print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}, rank={rank_to_use}, energy retained={energy_retained:.4f}")
-                    
-                    except Exception as e:
-                        print(f"Failed to compress {proj} for {name}: {e}")
-
-        # 保存压缩后的权重
-        save_dir = os.path.join("./svd_compressed", self.model_version)
-        os.makedirs(save_dir, exist_ok=True)
-        try:
-            torch.save(self.model_to_test.state_dict(), os.path.join(save_dir, "compressed_model.pth"))
-            print(f"Saved compressed model weights to {os.path.join(save_dir, 'compressed_model.pth')}")
-        except Exception as e:
-            print(f"Failed to save compressed model weights: {e}")
-
-    def load_svd_compressed_weights(self):
-        """
-        加载已压缩的注意力权重。
-        """
-        compressed_path = os.path.join("./svd_compressed", self.model_version, "compressed_model.pth")
-        if os.path.exists(compressed_path):
-            try:
-                print(f"Loading compressed weights from {compressed_path}")
-                self.model_to_test.load_state_dict(torch.load(compressed_path, map_location=self.model_to_test.device), strict=False)
-                print("Successfully loaded compressed weights.")
-            except Exception as e:
-                print(f"Failed to load compressed weights: {e}")
-        else:
-            print("No compressed weights found. Proceeding without loading.")
-
     def bound_evaluate_and_log(self, *args):
         self.evaluate_and_log(*args)
 
     def run_test(self, args):
         # Run through each iteration of context_lengths and depths
-        tasks = []
         for context_length in self.context_lengths:
             if context_length < args.s_len or context_length > args.e_len:
                 continue
             for depth_percent in self.document_depth_percents:
-                task = self.bound_evaluate_and_log(context_length, depth_percent)
+                self.bound_evaluate_and_log(context_length, depth_percent)
 
     def generate_prompt(self, context):
         test_format = f"<|im_start|> This is a very long story book: <book> {context} </book>.\n\nQuestion: Based on the content of the book, {self.retrieval_question}"
@@ -370,7 +330,7 @@ class LLMNeedleHaystackTester:
         # Simulate multiround conversation
         prompt = self.enc(prompt, return_tensors="pt")
 
-        prompt_input_ids = prompt["input_ids"].to(self.model_to_test.device)
+        prompt_input_ids = prompt["input_ids"].to(self.model_to_test.device)  # 移除 dtype=torch.bfloat16
 
         simulation_start_idx = prompt_input_ids.size(1) - self.simulation_length
 
@@ -404,7 +364,7 @@ class LLMNeedleHaystackTester:
                 )
                 past_key_values = output.past_key_values
 
-            pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+            pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)  # 移除 to(dtype=torch.bfloat16)
             generated_content = [pred_token_idx.item()]
             for _ in range(50):
                 outputs = self.model_to_test(
@@ -414,7 +374,7 @@ class LLMNeedleHaystackTester:
                 )
 
                 past_key_values = outputs.past_key_values
-                pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)  # 移除 to(dtype=torch.bfloat16)
                 generated_content += [pred_token_idx.item()]
                 if pred_token_idx.item() in self.eos_token_ids:
                     break
@@ -483,11 +443,31 @@ class LLMNeedleHaystackTester:
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(results, f)
 
+        # 新增：记录压缩后的权重矩阵信息
+        if self.args.enable_svd:
+            # 确保日志目录存在
+            if not os.path.exists("logs"):
+                os.makedirs("logs")
+            compressed_info = {
+                "model": self.model_to_test_description,
+                "context_length": context_length,
+                "depth_percent": depth_percent,
+                "sparsity": self.args.sparsity,
+                "compression_details": "SVD compression applied to Q, K, V, Wl weights."
+            }
+            compressed_log_path = f"logs/compressed_{self.model_to_test_description}_sparsity_{self.args.sparsity}.json"
+            with open(compressed_log_path, "a", encoding="utf-8") as f:
+                json.dump(compressed_info, f)
+                f.write("\n")  # 每条记录换行
+
     def result_exists(self, context_length, depth_percent):
         """
         Checks to see if a result has already been evaluated or not
-        """
 
+        :param context_length: Context length to check
+        :param depth_percent: Document depth percent to check
+        :return: True if result exists, False otherwise
+        """
         results_dir = "results/" + self.model_version
         print("Searching existing results at %s" % results_dir)
         if not os.path.exists(results_dir):
@@ -500,7 +480,6 @@ class LLMNeedleHaystackTester:
                     depth_percent_met = result["depth_percent"] == depth_percent
                     version_met = result.get("version", 1) == self.results_version
                     model_met = result["model"] == self.model_name
-                    # import ipdb; ipdb.set_trace()
                     if (
                         context_length_met
                         and depth_percent_met
@@ -519,7 +498,7 @@ class LLMNeedleHaystackTester:
         # Truncate the Paul Graham essays to the context length you desire
         context = self.encode_and_trim(context, context_length)
 
-        # Insert your random statement according to your depth percent
+        # Insert your needle statement according to your depth percent
         context = self.insert_needle(context, depth_percent, context_length)
 
         return context
@@ -597,7 +576,6 @@ class LLMNeedleHaystackTester:
     def start_test(self, args):
         if self.print_ongoing_status:
             self.print_start_test_summary()
-        # asyncio.run(self.run_test())
         self.run_test(args)
 
 
@@ -629,7 +607,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--prefilling_chunk_size", type=int, default=None)
 
-    parser.add_argument("--sparsity", type=float, default=0.5)
+    parser.add_argument("--sparsity", type=float, default=0.5, help="Compression ratio for SVD (0 < ratio <= 1)")
 
     parser.add_argument(
         "--method",
@@ -637,12 +615,10 @@ if __name__ == "__main__":
         default=None,
     )
 
-    # 新增SVD相关参数
-    parser.add_argument("--svd_rank", type=int, default=1024, help="SVD compression rank")
     parser.add_argument(
-        "--disable_svd",
-        action="store_true",
-        help="Disable SVD compression of attention weights.",
+        "--enable_svd",
+        action='store_true',
+        help="Enable SVD compression on Q, K, V, Wl weights"
     )
 
     args = parser.parse_args()
@@ -670,8 +646,6 @@ if __name__ == "__main__":
         document_depth_percent_intervals=args.document_depth_percent_intervals,
         document_depth_percent_min=args.document_depth_percent_min,
         document_depth_percent_max=args.document_depth_percent_max,
-        svd_rank=args.svd_rank,  # 传递SVD rank参数
-        disable_svd=args.disable_svd,  # 传递是否禁用SVD参数
     )
 
     ht.start_test(args)

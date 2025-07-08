@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 from datasets import load_dataset
 import torch
 import json
@@ -86,19 +87,18 @@ def parse_args(args=None):
         action="store_true",
         help="Enable SVD compression of attention weights"
     )
+    parser.add_argument("--head64_layers", type=str, default="",
+    help="逗号分隔层号；这些层的 k/v head_dim→64")
     parser.add_argument(
         "--svd_rank",
         type=int,
-        default=None,
+        default=512,
         help="Base SVD rank for compression (default: 1024)"
     )
-    '''
-    parser.add_argument(
-        "--load_compressed",
-        action="store_true",
-        help="Load SVD compressed weights if available"
-    )
-    '''
+    parser.add_argument("--new_head_dim", type=int, default=96,
+                        help="目标 head_dim（只在压缩时用）")
+    parser.add_argument("--compress_only", action="store_true",
+                        help="只做权重压缩并保存，然后立即退出")
     return parser.parse_args(args)
 
 
@@ -263,91 +263,86 @@ def get_pred(
     
     return preds
 
-def compress_attention_weights_with_head_dim(model, base_svd_rank=1024, new_head_dim=112, energy_ratio=0.997):
-    """
-    仅对 k_proj / v_proj 进行 head_dim 压缩；q_proj / o_proj 仅做低秩近似但不改变形状。
-    k/v 的输出维度为 num_kv_heads * new_head_dim。
-    """
-    import torch.nn as nn
+import torch.nn as nn
 
-    print(f"\n[INFO] 🔧 Compressing KV head_dim → {new_head_dim}...")
+def compress_attention_weights_and_reduce_head_dim(
+        model,
+        base_svd_rank       = 512,           # 全层 rank-SVD 等级
+        layers_to_compress  = (),            # 只这些层改 head_dim
+        new_head_dim        = 64,            # 目标 head_dim
+        save_root           = "./svd_head64_sel",
+        energy_ratio        = 0.997):
 
-    num_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-    target_out = num_kv_heads * new_head_dim
+    from pathlib import Path
+    save_root = Path(save_root)
+    ver = model.config._name_or_path.split("/")[-1]
+    (save_root / ver).mkdir(parents=True, exist_ok=True)
 
-    for name, module in model.named_modules():
-        if not (hasattr(module, "q_proj") and hasattr(module, "k_proj")):
-            continue
+    num_kv = getattr(model.config, "num_key_value_heads",
+                        model.config.num_attention_heads)
+    target_out = num_kv * new_head_dim      # 8 × 64 = 512
 
+    for layer_idx, layer in enumerate(model.model.layers):
+        sa = layer.self_attn
         for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            weight: torch.Tensor = getattr(module, proj_name).weight.data
-            out_dim, in_dim = weight.shape
+            W = getattr(sa, proj_name).weight.data     # [out, in]
 
-            try:
-                svd_rank_max = int(0.9 * min(out_dim, in_dim))
-                target_rank = min(base_svd_rank, svd_rank_max)
+            # ---------- rank-SVD ----------
+            out_dim, in_dim = W.shape
+            max_rank = int(0.9 * min(out_dim, in_dim))
+            r = min(base_svd_rank, max_rank)
 
-                U, S, Vh = torch.linalg.svd(weight.float(), full_matrices=False)
-                energy = torch.sum(S**2)
-                keep = (torch.cumsum(S**2, 0) < energy_ratio * energy).sum().item() + 1
-                keep = min(keep, target_rank)
-                U_r, S_r, Vh_r = U[:, :keep], S[:keep], Vh[:keep, :]
-            except RuntimeError as e:
-                print(f"[×] SVD failed on {name}.{proj_name}: {e}")
-                continue
+            U,S,Vh = torch.linalg.svd(W.float(), full_matrices=False)
+            keep = (torch.cumsum(S**2, 0) < energy_ratio*S.pow(2).sum()).sum().item()+1
+            keep = min(keep, r)
 
-            if proj_name in ["k_proj", "v_proj"]:
-                new_w = (torch.diag(S_r) @ Vh_r).to(weight.dtype)  # [keep, in_dim]
+            W_low = (U[:, :keep] @ torch.diag(S[:keep]) @ Vh[:keep]).to(W.dtype)
 
-                if new_w.shape[0] >= target_out:
-                    new_w = new_w[:target_out, :].contiguous()
-                else:
-                    pad = torch.zeros(target_out - new_w.shape[0], in_dim,
-                                       dtype=new_w.dtype, device=new_w.device)
-                    new_w = torch.cat([new_w, pad], dim=0)
+            # ---------- 行数裁减 ----------
+            if proj_name in ["k_proj", "v_proj"] and layer_idx in layers_to_compress:
+                # 裁成 target_out (=512)
+                W_low = W_low[:target_out]
+                linear = nn.Linear(in_dim, target_out, bias=False,
+                                    dtype=W.dtype, device=W.device)
+                linear.weight.data.copy_(W_low)
+                setattr(sa, proj_name, linear)
 
-                new_proj = nn.Linear(in_features=in_dim,
-                                     out_features=target_out,
-                                     bias=False,
-                                     dtype=new_w.dtype,
-                                     device=new_w.device)
-                new_proj.weight.data.copy_(new_w)
-                setattr(module, proj_name, new_proj)
-                print(f"✓ {name}.{proj_name}: {out_dim} → {target_out}")
+                # 同步 meta
+                sa.head_dim = new_head_dim
+                sa.scale    = 1 / (new_head_dim ** 0.5)
+                print(f"✓ L{layer_idx}.{proj_name}: {out_dim} → {target_out}")
             else:
-                new_w = (U_r @ torch.diag(S_r) @ Vh_r).to(weight.dtype)
-                weight.copy_(new_w)
-                print(f"✓ {name}.{proj_name}: low-rank approx, shape保持")
+                W[:W_low.shape[0]] = W_low   # 行数不改
+                print(f"✓ L{layer_idx}.{proj_name}: rank {keep}/{out_dim}")
 
-    model.config.head_dim = new_head_dim
-    model.config.hidden_size = model.config.num_attention_heads * new_head_dim
-
-    print("[✓] Head_dim compression (k/v) completed.")
+    torch.save(model.state_dict(),
+                save_root / ver / "compressed_model.pth")
+    print(f"✓ Weights saved to {save_root/ver/'compressed_model.pth'}")
 
 
-
+                    
 # 保存压缩后的权重
 def save_compressed_weights(model, model_version):
-    save_dir = os.path.join("./svd_compressed_head", model_version)
+    save_dir = os.path.join("./svd_compressed_head_dim", model_version)
     os.makedirs(save_dir, exist_ok=True)
     try:
         torch.save(model.state_dict(), os.path.join(save_dir, "compressed_model.pth"))
-        print(f"Saved compressed model weights to {os.path.join(save_dir, 'compressed_model.pth')}")
+        print(f"✓ Saved compressed weights to {save_dir}/compressed_model.pth")
     except Exception as e:
-        print(f"Failed to save compressed model weights: {e}")
+        print(f"× Failed to save compressed weights: {e}")
 
 # 加载压缩后的权重
 def load_svd_compressed_weights(model, model_version):
-    compressed_path = os.path.join("./svd_compressed_head", model_version, "compressed_model.pth")
+    compressed_path = os.path.join("./svd_compressed_head_dim", model_version, "compressed_model.pth")
     if os.path.exists(compressed_path):
         try:
-            print(f"Loading compressed weights from {compressed_path}")
-            model.load_state_dict(torch.load(compressed_path, map_location=model.device), strict=False)
-            print("Successfully loaded compressed weights.")
+            print(f"✓ Loading compressed weights from {compressed_path}")
+            model.load_state_dict(torch.load(compressed_path, map_location="cuda"), strict=False)
+            print("✓ Successfully loaded compressed weights.")
         except Exception as e:
-            print(f"Failed to load compressed weights: {e}")
+            print(f"× Failed to load compressed weights: {e}")
     else:
-        print("No compressed weights found. Proceeding without loading.")
+        print(f"× No compressed weights found at {compressed_path}")
 
 
 def seed_everything(seed):
@@ -430,101 +425,33 @@ def load_model_and_tokenizer(path, model_name):
     return model, tokenizer, eos_token_ids
 
 
+# ---------- main: only compress & save ----------
 if __name__ == "__main__":
-     # 在加载模型前初始化设备
-    global device
+    import sys, torch
     seed_everything(42)
-    args = parse_args()
-    model2path = json.load(open("eval/LongBench/config/model2path.json", "r"))
-    model2maxlen = json.load(open("eval/LongBench/config/model2maxlen.json", "r"))
-    device_list = [i for i in range(torch.cuda.device_count())]
-    model_name = args.model
+    args = parse_args()                          # 需有 --svd_rank --head64_layers
+
+    # 解析 head-64 层；空字符串 → 默认末 4 层
+    layers_to_compress = [int(x) for x in args.head64_layers.split(",") if x]
+    if not layers_to_compress:
+        L = 32                                   # 你的模型层数
+        layers_to_compress = list(range(L-4, L)) # [28,29,30,31]
+
+    # ---------- load ----------
+    model_path = json.load(open("eval/LongBench/config/model2path.json"))[args.model]
     device = select_device(args.model)
-    # define your model args.load_compressed
-    model, tokenizer, eos_token_ids = load_model_and_tokenizer(
-        model2path[model_name], model_name #, load_compressed=False
-    )
-    #model = to_device(model, device_list, enable_tp=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16,
+        attn_implementation="eager", device_map={"": device})
 
-        # 如果选择加载已压缩的权重
-    #if args.load_compressed:
-    #    load_svd_compressed_weights(model, model_name)
+    # ---------- compress ----------
+    compress_attention_weights_and_reduce_head_dim(
+        model,
+        base_svd_rank = args.svd_rank or 512,
+        layers_to_compress = layers_to_compress,
+        new_head_dim = 64,
+        save_root = "./svd_head64_sel")
 
-    # 如果选择进行 SVD 压缩
-    if args.compress_svd:
-        target_head_dim = 112
-        compress_attention_weights_with_head_dim(
-            model,
-            base_svd_rank=args.svd_rank,
-            new_head_dim=112,
-            energy_ratio=0.997
-            )
-        save_compressed_weights(model, model_name)
+    print("✓ all done, exit.")
+    sys.exit(0)
 
-    max_length = model2maxlen[model_name]
-    if args.e:
-        datasets = [
-            "qasper",
-            "multifieldqa_en",
-            "hotpotqa",
-            "2wikimqa",
-            "gov_report",
-            "multi_news",
-            "trec",
-            "triviaqa",
-            "samsum",
-            "passage_count",
-            "passage_retrieval_en",
-            "lcc",
-            "repobench-p",
-        ]
-    else:
-        datasets = [args.task]
-    # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("eval/LongBench/config/dataset2prompt.json", "r"))
-    dataset2maxlen = json.load(open("eval/LongBench/config/dataset2maxlen.json", "r"))
-    # predict on each dataset
-    if not os.path.exists("eval/LongBench/pred"):
-        os.makedirs("eval/LongBench/pred")
-    if not os.path.exists("eval/LongBench/pred_e"):
-        os.makedirs("eval/LongBench/pred_e")
-    for dataset in datasets:
-        #data = load_dataset("THUDM/LongBench", dataset, split="test")
-        #data = load_dataset("/datasets/THUDM/LongBench/LongBench.py", name=dataset, split="test")
-        #data = load_dataset("/datasets/THUDM/LongBench/longbench.py", name="hotpotqa", split="test")
-        #data = load_dataset("/home/xuezeyu/llm/duo-attention/datasets/THUDM/LongBench", name=dataset, split="test")
-        data = load_dataset(
-            "/home/xuezeyu/llm/duo-attention/datasets/THUDM/LongBench",
-            name=dataset,
-            split="test",
-            num_proc=1  # NEW: 强制单线程
-        )
-        print(data)
-        if not os.path.exists(f"eval/LongBench/pred/{model_name}"):
-            os.makedirs(f"eval/LongBench/pred/{model_name}")
-        #if args.method == "duo_attn":
-        #    out_path = f"eval/LongBench/pred/{model_name}/{dataset}-duo_attn-pattern-{args.attn_load_dir.split('/')[-1]}-sp-{args.sparsity}.jsonl"
-        #else:
-        #    out_path = f"eval/LongBench/pred/{model_name}/{dataset}-full.jsonl"
-        if args.method == "duo_attn":
-            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-duo_attn-pattern-{args.attn_load_dir.split('/')[-1]}-sp-{args.sparsity}.jsonl"
-        else:
-            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-full.jsonl"
-        prompt_format = dataset2prompt[dataset]
-        max_gen = dataset2maxlen[dataset]
-        preds = get_pred(
-            model,
-            tokenizer,
-            eos_token_ids,
-            data,
-            max_length,
-            max_gen,
-            prompt_format,
-            dataset,
-            model_name,
-            args.decoding_simulation_length,
-        )
-        with open(out_path, "w", encoding="utf-8") as f:
-            for pred in preds:
-                json.dump(pred, f, ensure_ascii=False)
-                f.write("\n")

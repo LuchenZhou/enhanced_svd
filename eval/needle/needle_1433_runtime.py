@@ -12,11 +12,13 @@ import numpy as np
 import argparse
 from rouge_score import rouge_scorer
 
+import torch
+from torch.linalg import svd  # 使用 torch.linalg.svd 进行奇异值分解
+
 scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
 
 from datetime import datetime, timezone
 import time
-import torch
 from duo_attn.patch import enable_duo_attention_eval
 
 from duo_attn.utils import (
@@ -25,7 +27,7 @@ from duo_attn.utils import (
     sparsify_attention_heads,
 )
 
-
+from torch.cuda.amp import autocast
 class LLMNeedleHaystackTester:
     """
     This class is used to test the LLM Needle Haystack.
@@ -59,8 +61,6 @@ class LLMNeedleHaystackTester:
         attn_load_dir=None,
         sparsity=0.5,
         simulation_length=50,
-        svd_rank=1024,  # 新增参数用于SVD压缩
-        disable_svd=False,  # 新增参数用于控制是否禁用SVD压缩
     ):
         """
         :param needle: The needle to be found in the haystack. Default is None.
@@ -83,8 +83,6 @@ class LLMNeedleHaystackTester:
         :param model_name: The name of the model. Default is 'gpt-4-1106-preview'.
         :param seconds_to_sleep_between_completions: The number of seconds to sleep between completions. Default is None.
         :param print_ongoing_status: Whether or not to print the ongoing status. Default is True.
-        :param svd_rank: The rank to use for SVD compression. Default is 1024.
-        :param disable_svd: Whether to disable SVD compression. Default is False.
         """
         if not needle or not haystack_dir or not retrieval_question:
             raise ValueError(
@@ -186,9 +184,18 @@ class LLMNeedleHaystackTester:
 
         self.model_to_test = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,  # 使用 float32 以便进行 SVD
             attn_implementation="eager",
+            output_hidden_states=False,  # 量化后无需隐藏状态
+            return_dict=True,  # 确保返回字典
         ).eval()
+
+        # 获取模型的最大序列长度
+        self.max_length = self.model_to_test.config.max_position_embeddings
+        print(f"Model max sequence length: {self.max_length}")
+
+        # 应用 SVD 量化
+        self.apply_svd_quantization(k=10)  # 选择保留前 10 个奇异值
 
         print(f"attn_load_dir: {attn_load_dir}")
 
@@ -224,13 +231,6 @@ class LLMNeedleHaystackTester:
         self.simulation_length = simulation_length
         model_name = model_name.split("/")[-1]
 
-        # 初始化SVD相关参数
-        self.svd_rank = svd_rank
-        self.disable_svd = disable_svd
-
-        if not self.disable_svd:
-            self.compress_attention_weights()
-
     def logistic(self, x, L=100, x0=50, k=0.1):
         if x == 0:
             return 0
@@ -238,116 +238,16 @@ class LLMNeedleHaystackTester:
             return 100
         return np.round(L / (1 + np.exp(-k * (x - x0))), 3)
 
-    def compress_attention_weights(self):
-        """
-        对模型中的注意力层权重进行SVD压缩，并保存压缩后的权重。
-        为每个投影层分配不同的svd_rank，确保svd_rank > input_svd_rank且 < 75%原始维度。
-        """
-        print("Starting SVD compression of attention weights...")
-        
-        # 基础的SVD秩，可以根据需要调整
-        base_svd_rank = self.svd_rank if self.svd_rank is not None else 1024  # 默认值为1024
-        
-        for name, module in self.model_to_test.named_modules():
-            # 检查模块是否包含注意力投影层
-            if hasattr(module, 'q_proj') and hasattr(module, 'k_proj') and hasattr(module, 'v_proj') and hasattr(module, 'o_proj'):
-                for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                    weight = getattr(module, proj).weight.data
-                    try:
-                        # 获取原始权重的形状
-                        dim1, dim2 = weight.shape
-                        
-                        # 计算每个投影层的svd_rank_max，确保它小于75% of max dimension
-                        svd_rank_max = int(0.75 * max(dim1, dim2))
-                        
-                        # 根据投影类型分配不同的svd_rank
-                        if proj in ['q_proj', 'k_proj', 'v_proj']:
-                            # 对于关键层，使用较高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 2, svd_rank_max)  # 例如2048
-                        elif proj == 'o_proj':
-                            # 对于o_proj，使用更高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 3, svd_rank_max)  # 例如3072
-                        else:
-                            current_svd_rank = min(base_svd_rank, svd_rank_max)
-                        
-                        # 进行SVD分解
-                        weight_float = weight.float()
-                        U, S, Vh = torch.linalg.svd(weight_float, full_matrices=False)
-                        
-                        # 计算总能量
-                        energy = torch.sum(S ** 2)
-                        cumulative_energy = torch.cumsum(S ** 2, dim=0)
-                        energy_threshold = 0.99 * energy
-                        
-                        # 选择rank，使得保留99%的能量
-                        rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
-                        
-                        # 设定压缩秩的上限
-                        rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 确保rank_to_use不低于基础svd_rank
-                        if rank_to_use < base_svd_rank:
-                            rank_to_use = base_svd_rank
-                            rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
-                        
-                        # 截断SVD分解结果
-                        U_truncated = U[:, :rank_to_use]
-                        S_truncated = S[:rank_to_use]
-                        Vh_truncated = Vh[:rank_to_use, :]
-                        
-                        # 重构压缩后的权重矩阵
-                        compressed_weight = torch.mm(U_truncated, torch.diag(S_truncated)).mm(Vh_truncated)
-                        
-                        # 转换回原始的数据类型
-                        compressed_weight = compressed_weight.to(weight.dtype)
-                        
-                        # 替换原始权重
-                        getattr(module, proj).weight.data = compressed_weight
-                        
-                        # 计算能量保留比例
-                        energy_retained = torch.sum(S_truncated ** 2).item() / energy.item()
-                        
-                        # 输出压缩信息
-                        print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}, rank={rank_to_use}, energy retained={energy_retained:.4f}")
-                    
-                    except Exception as e:
-                        print(f"Failed to compress {proj} for {name}: {e}")
-
-        # 保存压缩后的权重
-        save_dir = os.path.join("./svd_compressed", self.model_version)
-        os.makedirs(save_dir, exist_ok=True)
-        try:
-            torch.save(self.model_to_test.state_dict(), os.path.join(save_dir, "compressed_model.pth"))
-            print(f"Saved compressed model weights to {os.path.join(save_dir, 'compressed_model.pth')}")
-        except Exception as e:
-            print(f"Failed to save compressed model weights: {e}")
-
-    def load_svd_compressed_weights(self):
-        """
-        加载已压缩的注意力权重。
-        """
-        compressed_path = os.path.join("./svd_compressed", self.model_version, "compressed_model.pth")
-        if os.path.exists(compressed_path):
-            try:
-                print(f"Loading compressed weights from {compressed_path}")
-                self.model_to_test.load_state_dict(torch.load(compressed_path, map_location=self.model_to_test.device), strict=False)
-                print("Successfully loaded compressed weights.")
-            except Exception as e:
-                print(f"Failed to load compressed weights: {e}")
-        else:
-            print("No compressed weights found. Proceeding without loading.")
-
     def bound_evaluate_and_log(self, *args):
         self.evaluate_and_log(*args)
 
     def run_test(self, args):
         # Run through each iteration of context_lengths and depths
-        tasks = []
         for context_length in self.context_lengths:
             if context_length < args.s_len or context_length > args.e_len:
                 continue
             for depth_percent in self.document_depth_percents:
-                task = self.bound_evaluate_and_log(context_length, depth_percent)
+                self.bound_evaluate_and_log(context_length, depth_percent)
 
     def generate_prompt(self, context):
         test_format = f"<|im_start|> This is a very long story book: <book> {context} </book>.\n\nQuestion: Based on the content of the book, {self.retrieval_question}"
@@ -357,7 +257,17 @@ class LLMNeedleHaystackTester:
         # Checks to see if you've already checked a length/percent/version.
         # This helps if the program stop running and you want to restart later
         if self.save_results:
-            print("result does not exist, testing")
+            '''
+            if self.result_exists(context_length, depth_percent):
+                print("result exists, skipping")
+                return
+            else:
+            '''
+            if self.result_exists(context_length, depth_percent):
+                print("result does not exist, testing")
+
+        # 确保 context_length 不超过模型的最大序列长度减去提问长度
+        context_length = min(context_length, self.max_length - self.simulation_length)
 
         # Go generate the required length context and place your needle statement in
         context = self.generate_context(context_length, depth_percent)
@@ -368,15 +278,16 @@ class LLMNeedleHaystackTester:
         test_start_time = time.time()
 
         # Simulate multiround conversation
-        prompt = self.enc(prompt, return_tensors="pt")
-
-        prompt_input_ids = prompt["input_ids"].to(self.model_to_test.device)
+        prompt_encoded = self.enc(prompt, return_tensors="pt")
+        prompt_input_ids = prompt_encoded["input_ids"].to(self.model_to_test.device)
 
         simulation_start_idx = prompt_input_ids.size(1) - self.simulation_length
 
         question_input_ids = prompt_input_ids[:, simulation_start_idx:]
         prompt_input_ids = prompt_input_ids[:, :simulation_start_idx]
-
+        
+        # Convert the model to fp16 if necessary
+        self.model_to_test = self.model_to_test.half()
         with torch.no_grad():
             if self.args.prefilling_chunk_size is not None:
                 past_key_values = None
@@ -384,23 +295,34 @@ class LLMNeedleHaystackTester:
                     0, prompt_input_ids.size(1), self.args.prefilling_chunk_size
                 ):
                     chunk = prompt_input_ids[:, i : i + self.args.prefilling_chunk_size]
+                    chunk = chunk.long()  # Convert to Long type
+                     # Ensure the chunk is in fp16
+                    chunk = chunk.half()
+
                     output = self.model_to_test(
                         input_ids=chunk,
                         past_key_values=past_key_values,
                         use_cache=True,
+                        return_dict=True,  # 确保返回字典
                     )
                     past_key_values = output.past_key_values
             else:
+                prompt_input_ids = prompt_input_ids.long()
+                prompt_input_ids = prompt_input_ids.half()
+
                 output = self.model_to_test(
-                    input_ids=prompt_input_ids, past_key_values=None, use_cache=True
+                    input_ids=prompt_input_ids, past_key_values=None, use_cache=True, return_dict=True
                 )
                 past_key_values = output.past_key_values
 
             for input_id in question_input_ids[0]:
+                input_id = input_id.unsqueeze(0).unsqueeze(0).half()
+
                 output = self.model_to_test(
                     input_ids=input_id.unsqueeze(0).unsqueeze(0),
                     past_key_values=past_key_values,
                     use_cache=True,
+                    return_dict=True,  # 确保返回字典
                 )
                 past_key_values = output.past_key_values
 
@@ -411,6 +333,7 @@ class LLMNeedleHaystackTester:
                     input_ids=pred_token_idx,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    return_dict=True,  # 确保返回字典
                 )
 
                 past_key_values = outputs.past_key_values
@@ -500,7 +423,6 @@ class LLMNeedleHaystackTester:
                     depth_percent_met = result["depth_percent"] == depth_percent
                     version_met = result.get("version", 1) == self.results_version
                     model_met = result["model"] == self.model_name
-                    # import ipdb; ipdb.set_trace()
                     if (
                         context_length_met
                         and depth_percent_met
@@ -575,6 +497,7 @@ class LLMNeedleHaystackTester:
     def encode_and_trim(self, context, context_length):
         tokens = self.get_tokens_from_context(context)
         if len(tokens) > context_length:
+            tokens = tokens[:context_length]
             context = self.decode_tokens(tokens, context_length)
         return context
 
@@ -597,8 +520,38 @@ class LLMNeedleHaystackTester:
     def start_test(self, args):
         if self.print_ongoing_status:
             self.print_start_test_summary()
-        # asyncio.run(self.run_test())
         self.run_test(args)
+
+    def svd_quantize_weights(self, weight_matrix, k):
+        """
+        对权重矩阵进行 SVD 量化，保留前 k 个奇异值。
+
+        :param weight_matrix: 原始权重矩阵 (torch.Tensor)
+        :param k: 保留的奇异值数量
+        :return: 量化后的权重矩阵 (torch.Tensor)
+        """
+        try:
+            U, S, Vh = svd(weight_matrix, full_matrices=False)
+            U_k = U[:, :k]
+            S_k = torch.diag(S[:k])
+            Vh_k = Vh[:k, :]
+            quantized_matrix = torch.mm(U_k, torch.mm(S_k, Vh_k))
+            return quantized_matrix
+        except Exception as e:
+            print(f"SVD 量化失败: {e}")
+            return weight_matrix  # 如果失败，返回原始权重
+
+    def apply_svd_quantization(self, k=10):
+        """
+        对模型中的 Q、K、V 和 O 矩阵应用 SVD 量化。
+
+        :param k: 保留的奇异值数量
+        """
+        for name, param in self.model_to_test.named_parameters():
+            if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'out_proj']):
+                print(f"Applying SVD quantization to {name}")
+                quantized_weight = self.svd_quantize_weights(param.data, k)
+                param.data = quantized_weight
 
 
 if __name__ == "__main__":
@@ -637,14 +590,6 @@ if __name__ == "__main__":
         default=None,
     )
 
-    # 新增SVD相关参数
-    parser.add_argument("--svd_rank", type=int, default=1024, help="SVD compression rank")
-    parser.add_argument(
-        "--disable_svd",
-        action="store_true",
-        help="Disable SVD compression of attention weights.",
-    )
-
     args = parser.parse_args()
 
     if args.model_path is not None:
@@ -670,8 +615,6 @@ if __name__ == "__main__":
         document_depth_percent_intervals=args.document_depth_percent_intervals,
         document_depth_percent_min=args.document_depth_percent_min,
         document_depth_percent_max=args.document_depth_percent_max,
-        svd_rank=args.svd_rank,  # 传递SVD rank参数
-        disable_svd=args.disable_svd,  # 传递是否禁用SVD参数
     )
 
     ht.start_test(args)

@@ -228,8 +228,84 @@ class LLMNeedleHaystackTester:
         self.svd_rank = svd_rank
         self.disable_svd = disable_svd
 
+        # 初始化用于记录FFN层执行时间的字典
+        self.ffn_timing = {}
+        # 注册FFN层的钩子
+        self.register_ffn_hooks()
+
         if not self.disable_svd:
             self.compress_attention_weights()
+
+    def ffn_forward_pre_hook(self, module, input):
+        if torch.cuda.is_available():
+            module._start_event = torch.cuda.Event(enable_timing=True)
+            module._start_event.record()
+        else:
+            module._start_time = time.time()
+        #print(f"Pre-hook triggered for: {module}")
+
+    
+    def ffn_forward_hook(self, module, input, output):
+        # 记录结束时间
+        if torch.cuda.is_available():
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed_time = module._start_event.elapsed_time(end_event)  # 毫秒
+        else:
+            end_time = time.time()
+            elapsed_time = end_time - module._start_time  # 秒
+        
+        # 累积执行时间和调用次数
+        if module not in self.ffn_timing:
+            self.ffn_timing[module] = {'total_time': 0.0, 'count': 0}
+        if torch.cuda.is_available():
+            self.ffn_timing[module]['total_time'] += elapsed_time / 1000.0  # 转为秒
+        else:
+            self.ffn_timing[module]['total_time'] += elapsed_time
+        self.ffn_timing[module]['count'] += 1
+
+        # 调试打印
+        #if torch.cuda.is_available():
+        #    print(f"Post-hook triggered for: {module}, elapsed_time: {elapsed_time:.4f} ms")
+        #else:
+        #    print(f"Post-hook triggered for: {module}, elapsed_time: {elapsed_time:.6f} s")
+
+    def register_ffn_hooks(self):
+        """
+        查找模型中的 FFN 层（fc1 和 fc2），并为其注册前向钩子。
+        """
+        # 定义 FFN 层的完整名称
+        ffn_layer_keywords = ['mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']
+
+        # 追踪是否成功注册了钩子
+        hooks_registered = {name: False for name in ffn_layer_keywords}
+
+        for name, module in self.model_to_test.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                for keyword in ffn_layer_keywords:
+                    if name.endswith(keyword):
+                        # 注册前向前钩子
+                        module.register_forward_pre_hook(self.ffn_forward_pre_hook)
+                        # 注册前向后钩子
+                        module.register_forward_hook(self.ffn_forward_hook)
+                        print(f"Registered hooks for FFN layer: {name}")
+                        hooks_registered[keyword] = True
+                        break  # 一个模块只能匹配一个关键词
+        #检查所有钩子是否都已注册
+        for keyword, registered in hooks_registered.items():
+            if not registered:
+                print(f"Warning: FFN layer '{name}' not found and hooks were not registered.")
+
+    def calculate_and_print_ffn_timing(self):
+        """
+        计算并打印每个 FFN 层的平均执行时间。
+        """
+        print("\n-- FFN Layers Execution Time --")
+        for module, timing in self.ffn_timing.items():
+            avg_time = timing['total_time'] / timing['count'] if timing['count'] > 0 else 0.0
+            print(f"Layer: {module}, Average Execution Time: {avg_time * 1000:.4f} ms over {timing['count']} runs")
+        print("-- End of FFN Layers Execution Time --\n")
 
     def logistic(self, x, L=100, x0=50, k=0.1):
         if x == 0:
@@ -257,16 +333,16 @@ class LLMNeedleHaystackTester:
                         # 获取原始权重的形状
                         dim1, dim2 = weight.shape
                         
-                        # 计算每个投影层的svd_rank_max，确保它小于75% of max dimension
-                        svd_rank_max = int(0.75 * max(dim1, dim2))
+                        # 计算每个投影层的svd_rank_max，确保它小于75%/85% of max dimension
+                        svd_rank_max = int(0.85 * max(dim1, dim2))
                         
                         # 根据投影类型分配不同的svd_rank
                         if proj in ['q_proj', 'k_proj', 'v_proj']:
                             # 对于关键层，使用较高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 2, svd_rank_max)  # 例如2048
+                            current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如2048/3072
                         elif proj == 'o_proj':
                             # 对于o_proj，使用更高的svd_rank，确保保留更多信息
-                            current_svd_rank = min(base_svd_rank * 3, svd_rank_max)  # 例如3072
+                            current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如3072
                         else:
                             current_svd_rank = min(base_svd_rank, svd_rank_max)
                         
@@ -277,7 +353,7 @@ class LLMNeedleHaystackTester:
                         # 计算总能量
                         energy = torch.sum(S ** 2)
                         cumulative_energy = torch.cumsum(S ** 2, dim=0)
-                        energy_threshold = 0.99 * energy
+                        energy_threshold = 0.997 * energy
                         
                         # 选择rank，使得保留99%的能量
                         rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
@@ -449,6 +525,7 @@ class LLMNeedleHaystackTester:
             print(f"Depth: {depth_percent}%")
             print(f"Score: {score}")
             print(f"Response: {response}\n")
+            #self.calculate_and_print_ffn_timing()
 
         context_file_location = f'{self.model_version.replace(".", "_")}_len_{context_length}_depth_{int(depth_percent*100)}'
 
@@ -599,7 +676,8 @@ class LLMNeedleHaystackTester:
             self.print_start_test_summary()
         # asyncio.run(self.run_test())
         self.run_test(args)
-
+        # 计算并打印 FFN 层的执行时间
+        self.calculate_and_print_ffn_timing()
 
 if __name__ == "__main__":
     # Tons of defaults set, check out the LLMNeedleHaystackTester's init for more info
