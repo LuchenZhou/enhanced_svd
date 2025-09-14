@@ -4,7 +4,7 @@
 ## Abstract
 Long context large language model inference is constrained by key value (KV) cache memory and latency. Existing methods such as windowing and uniform low rank compression reduce computation or the KV footprint, but they often impair long range retrieval or require a subset of heads to keep full context, which limits efficiency at long lengths. We present SEDPA, a Singular Value Decomposition (SVD) enhanced dual path attention framework with two variants: SEDPA S, which applies SVD to compress projections and speed up inference; and SEDPA W, which extends SEDPA S with a sliding window to further lower latency at small accuracy cost. SEDPA supports task dependent tradeoffs between accuracy and speed. On Llama 2 7B 32K and Llama 3 8B 1048K, SEDPA S reduces parameters by 11% to 15% while keeping Needle in a Haystack (NIAH) accuracy within 1.1 percentage points of DuoAttention and achieving comparable LongBench macro scores. SEDPA W maintains accuracy and reduces decode latency, KV cache memory, and peak memory by 10% to 25%.
 
-#### Environment Setup
+#### Environment
 
 ```bash
 conda create -yn duo python=3.10
@@ -31,7 +31,11 @@ git clone https://github.com:mit-han-lab/Block-Sparse-Attention
 cd Block-Sparse-Attention
 python setup.py install
 ```
-
+**##Model**
+```bash
+huggingface-cli download togethercomputer/Llama-2-7B-32K-Instruct --local-dir Llama-2-7B-32K-Instruct
+huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-1048k --local-dir Llama-3-8B-Instruct-Gradient-1048k
+```
 
 ## Experiment
 #motivation
