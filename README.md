@@ -21,72 +21,19 @@ pip install tensor_parallel==2.0.0
 pip install ninja packaging
 pip install flash-attn==2.6.3 --no-build-isolation
 
-# LongBench evaluation
 pip install seaborn rouge_score einops pandas
 
 pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 
-# Install DuoAttention
 pip install -e .
 
-# Install Block Sparse Streaming Attention
 git clone https://github.com:mit-han-lab/Block-Sparse-Attention
 cd Block-Sparse-Attention
 python setup.py install
 ```
 
 
-## Quick Start for DuoAttention
-We offer a simple one-click patch to enable DuoAttention optimization on HuggingFace models, including Llama and Mistral. Pretrained retrieval head patterns for five long-context models are available in the `attn_patterns` directory: `Llama-2-7B-32K-Instruct`, `Llama-3-8B-Instruct-Gradient-1048k`, `Llama-3-8B-Instruct-Gradient-4194k`, `Mistral-7B-Instruct-v0.2`, `Mistral-7B-Instruct-v0.3`, and `Meta-Llama-3.1-8B-Instruct`. If you'd like to train your own retrieval head patterns, you can use the training script provided in the scripts directory. Below is an example of how to enable DuoAttention on the `Llama-3-8B-Instruct-Gradient-1048k` model.
-
-
-```python
-from duo_attn.utils import load_attn_pattern, sparsify_attention_heads
-from duo_attn.patch import enable_duo_attention_eval
-import transformers
-import torch
-
-# Load the model
-model = transformers.AutoModelForCausalLM.from_pretrained(
-    "models/Llama-3-8B-Instruct-Gradient-1048k",
-    torch_dtype=torch.bfloat16,
-    low_cpu_mem_usage=True,
-    attn_implementation="eager",
-)
-
-# Load the attention pattern
-attn_heads, sink_size, recent_size = load_attn_pattern(
-    "attn_patterns/Llama-3-8B-Instruct-Gradient-1048k/lr=0.02-reg=0.05-ctx=1000_32000-multi_passkey10"
-)
-
-# Sparsify attention heads
-attn_heads, sparsity = sparsify_attention_heads(attn_heads, sparsity=0.5)
-
-# Enable DuoAttention
-enable_duo_attention_eval(
-    model,
-    attn_heads,
-    sink_size=64,
-    recent_size=256,
-)
-
-# Move model to GPU
-model = model.cuda()
-
-# Ready for inference!
-```
-
-## Demo
-After setting up the environment, you can run the following script to execute the W4A8KV4 with DuoAttention demo on the `Llama-3-8B-Instruct-Gradient-4194k` model. The demo is designed to run on a single A100 GPU and supports a context length of up to 3.3 million tokens.
-
-```bash
-bash scripts/run_demo.sh
-```
-
-## Results 
-
-### Retrieval Head Identification
-After preparing the dataset and models, you can run the training script to identify the retrieval heads. For the models we evaluated, the corresponding attention patterns are available in the `attn_patterns` directory.
+## Experiment
 
 ```bash
 bash scripts/run_train.sh
