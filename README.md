@@ -36,15 +36,19 @@ python setup.py install
 huggingface-cli download togethercomputer/Llama-2-7B-32K-Instruct --local-dir Llama-2-7B-32K-Instruct
 huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-1048k --local-dir Llama-3-8B-Instruct-Gradient-1048k
 ```
+**Dataset**
+```bash
+wget https://huggingface.co/datasets/togethercomputer/Long-Data-Collections/resolve/main/fine-tune/booksum.jsonl.zst
+```
 
 ## Experiment
-#motivation
+motivation
 ```bash
 python needle_in_haystack_with_mask.py --mask_top 30 --s 1000 --e 100000  --model_path $path_to_model  
 python needle_in_haystack_with_mask.py --mask_top -30 --s 1000 --e 100000  --model_path $path_to_model  
 python head_score.py
 ```
-#train
+train
 ```bash
 bash scripts/run_train.sh
 ```
