@@ -31,7 +31,7 @@ git clone https://github.com:mit-han-lab/Block-Sparse-Attention
 cd Block-Sparse-Attention
 python setup.py install
 ```
-**##Model**
+**Model**
 ```bash
 huggingface-cli download togethercomputer/Llama-2-7B-32K-Instruct --local-dir Llama-2-7B-32K-Instruct
 huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-1048k --local-dir Llama-3-8B-Instruct-Gradient-1048k
