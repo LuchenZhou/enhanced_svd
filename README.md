@@ -39,14 +39,11 @@ python setup.py install
 bash scripts/run_train.sh
 ```
 
-### Needle in a Haystack (NIAH)
-DuoAttention provides comparable accuracy as full attention on the Needle-in-a-Haystack benchmark using 25% full attention ratio on the MHA model and 50% full attention ratio on the GQA model.
+### Needle-in-a-Haystack (NIAH)
 
 ```bash
 bash scripts/run_niah.sh
 ```
-
-![niah](figures/niah.jpg)
 
 ### LongBench
 
@@ -54,45 +51,9 @@ bash scripts/run_niah.sh
 bash scripts/run_longbench.sh
 ```
 
-DuoAttention provides better KV budget and accuracy trade-off on LongBench benchmarks.
-
-![longbench](figures/longbench.jpg)
-
 ### Efficiency
 
 ```bash
 bash scripts/run_efficiency.sh
 ```
 
-- Per-token decoding latency and memory usage of DuoAttention compared to full attention across varying context sizes. DuoAttention uses a 25% retrieval head ratio for Llama-2-7B (MHA) and 50% for Llama-3-8B (GQA). DuoAttention achieves up to 2.45× memory reduction for MHA and 1.65× for GQA models, along with up to 2.13× latency reduction for MHA and 1.5× for GQA models. These reductions approach the inverse of the retrieval head ratios as context length increases. Out-of-memory (OOM) results are linearly extrapolated from measured data.
-
-![efficiency_decoding](figures/efficiency_decoding.jpg)
-
-- Pre-filling latency and memory usage of DuoAttention compared to full attention across varying
-pre-filling chunk sizes. DuoAttention uses a 25% retrieval head ratio for Llama-2-7B (MHA), pre-filling a context of 100K tokens, and a 50% ratio for Llama-3-8B (GQA), pre-filling a context of 320K tokens. As the pre-filling chunk size decreases, DuoAttention achieves up to 1.73× latency reduction for MHA and 1.63× for GQA models, with memory reductions up to 2.38× for MHA and 1.53× for GQA models.
-
-![efficiency_prefilling](figures/efficiency_prefilling.jpg)
-
-- DuoAttention’s decoding memory and latency vs. KV budget with a fixed context length. Memory and latency are reduced linearly when the ratio of retrieval heads is reduced. DuoAttention
-achieves up to 2.55× memory reduction for MHA and 1.67× for GQA models, along with up to 2.18× latency reduction for MHA and 1.50× for GQA models.
-
-![efficiency_curve](figures/efficiency_curve.jpg)
-
-- Combined with 8-bit weight and 4-bit KV cache quantization, DuoAttention can accommodate 3.3 million tokens on a single A100-80G GPU for the Llama-3-8B model.
-
-<p align="center">
-<img src="figures/kv_capacity.jpg" alt="kv_capacity" width="400"/>
-</p>
-
-## Citation
-
-If you find DuoAttention useful or relevant to your project and research, please kindly cite our paper:
-
-```bibtex
-@article{xiao2024duo,
-        title={DuoAttention: Efficient Long-Context LLM Inference with Retrieval and Streaming Heads},
-        author={Xiao, Guangxuan and Tang, Jiaming and Zuo, Jingwei and Guo, Junxian and Yang, Shang and Tang, Haotian and Fu, Yao and Han, Song},
-        journal={arXiv},
-        year={2024}
-}
-```
