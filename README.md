@@ -69,6 +69,6 @@ bash scripts/run_longbench_1.sh
 ### Efficiency
 
 ```bash
-bash scripts/run_efficiency.sh
+bash scripts/run_efficiency_svd.sh
 ```
 
