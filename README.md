@@ -1,32 +1,10 @@
-# DuoAttention: Efficient Long-Context LLM Inference with Retrieval and Streaming Heads
-[[paper](https://arxiv.org/abs/2410.10819)] [[slides](figures/DuoAttention.pdf)]
+# SEDPA: SVD-ENHANCED DUAL PATH ATTENTION FOR EFFICIENT INFERENCE
 
-![method1](figures/method1.jpg)
-![method2](figures/method2.jpg)
-
-## Demo
-
-https://github.com/user-attachments/assets/b372882b-bf14-4c89-a610-22724d91a415
-
-## TL;DR
-We significantly reduce both pre-filling and decoding memory and latency for long-context LLMs without sacrificing their long-context abilities.
 
 ## Abstract
-Deploying long-context large language models (LLMs) is essential but poses significant computational and memory challenges.
-Caching all Key and Value (KV) states across all attention heads consumes substantial memory.
-Existing KV cache pruning methods either damage the long-context capabilities of LLMs or offer only limited efficiency improvements.
-In this paper, we identify that only a fraction of attention heads, a.k.a, Retrieval Heads, are critical for processing long contexts and require full attention across all tokens.
-In contrast, all other heads, which primarily focus on recent tokens and attention sinks, referred to as Streaming Heads, do not require full attention.
-Based on this insight, we introduce DuoAttention, a framework that only applies a full KV cache to retrieval heads while using a light-weight, constant-length KV cache for streaming heads, which reduces both LLM's decoding and pre-filling memory and latency without compromising its long-context abilities.
-DuoAttention uses a lightweight, optimization-based algorithm with synthetic data to identify retrieval heads accurately.
-Our method significantly reduces long-context inference memory by up to 2.55x for MHA and 1.67x for GQA models while speeding up decoding by up to 2.18x and 1.50x and accelerating pre-filling by up to 1.73x and 1.63x for MHA and GQA models, respectively, with minimal accuracy loss compared to full attention.
-Notably, combined with quantization, DuoAttention enables Llama-3-8B decoding with 3.3 million context length on a single A100 GPU.
+Long context large language model inference is constrained by key value (KV) cache memory and latency. Existing methods such as windowing and uniform low rank compression reduce computation or the KV footprint, but they often impair long range retrieval or require a subset of heads to keep full context, which limits efficiency at long lengths. We present SEDPA, a Singular Value Decomposition (SVD) enhanced dual path attention framework with two variants: SEDPA S, which applies SVD to compress projections and speed up inference; and SEDPA W, which extends SEDPA S with a sliding window to further lower latency at small accuracy cost. SEDPA supports task dependent tradeoffs between accuracy and speed. On Llama 2 7B 32K and Llama 3 8B 1048K, SEDPA S reduces parameters by 11% to 15% while keeping Needle in a Haystack (NIAH) accuracy within 1.1 percentage points of DuoAttention and achieving comparable LongBench macro scores. SEDPA W maintains accuracy and reduces decode latency, KV cache memory, and peak memory by 10% to 25%.
 
-## Installation and Usage
-
-### Environment Setup
-
-#### Training and Evaluation Environment
+#### Environment Setup
 
 ```bash
 conda create -yn duo python=3.10
@@ -57,60 +35,6 @@ cd Block-Sparse-Attention
 python setup.py install
 ```
 
-
-#### Demo Environment
-```bash
-conda create -yn duo_demo python=3.10
-conda activate duo_demo
-
-# Install DuoAttention
-pip install -e .
-
-conda install -y git
-conda install -y nvidia/label/cuda-12.4.0::cuda-toolkit
-conda install -y nvidia::cuda-cudart-dev
-
-# Install QServe
-git clone https://github.com:mit-han-lab/qserve
-cd qserve
-pip install -e .
-pip install ninja packaging
-pip install flash-attn==2.4.1 --no-build-isolation
-cd kernels
-python setup.py install
-
-# Install FlashInfer
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
-pip install tensor_parallel
-```
-
-### Dataset
-To download the dataset:
-
-```bash
-mkdir -p datasets
-cd datasets
-
-wget https://huggingface.co/datasets/togethercomputer/Long-Data-Collections/resolve/main/fine-tune/booksum.jsonl.zst
-```
-
-### Model
-To download models supported by DuoAttention:
-```bash
-mkdir -p models
-cd models
-
-# Models that DuoAttention currently supports for evaluation
-huggingface-cli download togethercomputer/Llama-2-7B-32K-Instruct --local-dir Llama-2-7B-32K-Instruct
-huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-1048k --local-dir Llama-3-8B-Instruct-Gradient-1048k
-huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-4194k --local-dir Llama-3-8B-Instruct-Gradient-4194k
-huggingface-cli download mistralai/Mistral-7B-Instruct-v0.2 --local-dir Mistral-7B-Instruct-v0.2
-huggingface-cli download mistralai/Mistral-7B-Instruct-v0.3 --local-dir Mistral-7B-Instruct-v0.3
-
-#  W8A8KV4 models using SmoothQuant and QServe for demo purposes
-huggingface-cli download mit-han-lab/Llama-3-8B-Instruct-Gradient-1048k-w8a8kv4-per-channel --local-dir Llama-3-8B-Instruct-Gradient-1048k-w8a8kv4-per-channel
-huggingface-cli download mit-han-lab/Llama-3-8B-Instruct-Gradient-4194k-w8a8kv4-per-channel --local-dir Llama-3-8B-Instruct-Gradient-4194k-w8a8kv4-per-channel
-```
 
 ## Quick Start for DuoAttention
 We offer a simple one-click patch to enable DuoAttention optimization on HuggingFace models, including Llama and Mistral. Pretrained retrieval head patterns for five long-context models are available in the `attn_patterns` directory: `Llama-2-7B-32K-Instruct`, `Llama-3-8B-Instruct-Gradient-1048k`, `Llama-3-8B-Instruct-Gradient-4194k`, `Mistral-7B-Instruct-v0.2`, `Mistral-7B-Instruct-v0.3`, and `Meta-Llama-3.1-8B-Instruct`. If you'd like to train your own retrieval head patterns, you can use the training script provided in the scripts directory. Below is an example of how to enable DuoAttention on the `Llama-3-8B-Instruct-Gradient-1048k` model.
