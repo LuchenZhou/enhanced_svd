@@ -34,11 +34,16 @@ python setup.py install
 
 
 ## Experiment
-
+#motivation
+```bash
+python needle_in_haystack_with_mask.py --mask_top 30 --s 1000 --e 100000  --model_path $path_to_model  
+python needle_in_haystack_with_mask.py --mask_top -30 --s 1000 --e 100000  --model_path $path_to_model  
+python head_score.py
+```
+#train
 ```bash
 bash scripts/run_train.sh
 ```
-
 ### Needle-in-a-Haystack (NIAH)
 
 ```bash
