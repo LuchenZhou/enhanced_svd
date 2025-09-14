@@ -49,6 +49,8 @@ bash scripts/run_niah.sh
 
 ```bash
 bash scripts/run_longbench.sh
+
+bash scripts/run_longbench_1.sh
 ```
 
 ### Efficiency
