@@ -52,11 +52,6 @@ train
 ```bash
 bash scripts/run_train.sh
 ```
-### Needle-in-a-Haystack (NIAH)
-
-```bash
-bash scripts/run_niah.sh
-```
 
 ### LongBench
 
@@ -64,6 +59,11 @@ bash scripts/run_niah.sh
 bash scripts/run_longbench.sh
 
 bash scripts/run_longbench_1.sh
+```
+### Needle-in-a-Haystack (NIAH)
+
+```bash
+bash scripts/run_niah.sh
 ```
 
 ### Efficiency
