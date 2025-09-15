@@ -12,8 +12,8 @@ from tqdm import tqdm
 import numpy as np
 import random
 import argparse
-import signal  # 新增
-from contextlib import contextmanager  # 新增
+import signal  
+from contextlib import contextmanager  
 
 from duo_attn.patch import enable_duo_attention_eval
 
@@ -24,25 +24,21 @@ from duo_attn.utils import (
 )
 from duo_attn.patch.tuple_kv_cache import enable_tuple_kv_cache
 
-# 新增超时处理类
 class TimeoutException(Exception): pass
 
-# 在文件顶部添加
 def select_device(model_name):
-    """智能设备选择逻辑"""
-    # 根据模型名称选择设备
-    if "1048k" in model_name:  # 大模型分配到H100
-        for dev in [0]:  # H100设备号
+    if "1048k" in model_name:  # H100
+        for dev in [0]:  # H100
             if torch.cuda.memory_allocated(dev) < 0.8 * torch.cuda.get_device_properties(dev).total_memory:
                 return f"cuda:{dev}"
-    else:  # 常规模型分配到RTX4090
-        for dev in [0,1,3]:  # RTX4090设备号
+    else:  # RTX4090
+        for dev in [0,1,3]:  # 4090
             if torch.cuda.memory_allocated(dev) < 0.7 * torch.cuda.get_device_properties(dev).total_memory:
                 return f"cuda:{dev}"
-    return "cuda:0"  # 默认设备
+    return "cuda:0"  
 
 @contextmanager
-def time_limit(seconds):  # 新增
+def time_limit(seconds):  
     def signal_handler(signum, frame):
         raise TimeoutException("Timed out!")
     signal.signal(signal.SIGALRM, signal_handler)
@@ -144,11 +140,11 @@ def get_pred(
     model_name,
     decoding_simulation_length,
 ):
-    print("正在处理第一条数据...")
+    print("Processing first data...")
     test_input = "This is a test"
-    # 修改点1：强制测试数据到cuda:0
+    # 1：cuda:0
     test_tokens = tokenizer(test_input, return_tensors="pt").to(device)
-    print(f"测试Tokenization完成，形状: {test_tokens.input_ids.shape}")
+    print(f"Tokenization finish，shape: {test_tokens.input_ids.shape}")
 
     preds = []
     pbar = tqdm(data)
@@ -158,7 +154,6 @@ def get_pred(
     
     for idx, json_obj in enumerate(pbar):
         try:
-            # ==== 输入处理 ====
             prompt = prompt_format.format(**json_obj)
             tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
             
@@ -174,19 +169,19 @@ def get_pred(
             if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
                 prompt = build_chat(tokenizer, prompt, model_name)
 
-            # 修改点2：强制输入到cuda:0
+            # 2：cuda:0
             input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
             current_len = input.input_ids.shape[-1]
             pbar.set_description(f"Generating {idx}, len={min(current_len, SAFE_CTX_LEN)}")
             
             simulation_start_idx = max(0, current_len - min(decoding_simulation_length, 512))
             
-            print(f"当前显存占用: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            print(f"memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
             torch.cuda.current_stream().synchronize()
             
             with torch.no_grad(), time_limit(300):
-                # 修改点3：添加设备检查
-                assert input.input_ids.device == torch.device(device), "输入设备错误"
+                # 3：
+                assert input.input_ids.device == torch.device(device), "error"
                 
                 output = model(
                     input_ids=input.input_ids[:, :simulation_start_idx],
@@ -195,16 +190,15 @@ def get_pred(
                 )
                 past_key_values = output.past_key_values
                 
-                # ==== 步骤3：修复KV缓存设备 ====
                 if decoding_simulation_length > 0:
                     sim_tokens = input.input_ids[0, simulation_start_idx:simulation_start_idx+512]
                     for i, input_id in enumerate(sim_tokens):
                         if i >= 512:
                             break
-                        # 修改点4：强制输入到cuda:0
+                        # 4：cuda:0
                         input_id = input_id.to(device)
                         
-                        # 修改点5：同步缓存设备
+                        # 5
                         past_key_values = tuple(
                             (k.to(device), v.to(device)) 
                             for k, v in past_key_values
@@ -217,12 +211,10 @@ def get_pred(
                         )
                         past_key_values = output.past_key_values
                 
-                # ==== 步骤4：生成阶段设备同步 ====
                 pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1).to("cuda:0")
                 generated_content = [pred_token_idx.item()]
                 
                 for step in range(SAFE_GEN_LEN - 1):
-                    # 修改点6：同步缓存设备
                     past_key_values = tuple(
                         (k.to(device), v.to(device)) 
                         for k, v in past_key_values
@@ -238,12 +230,12 @@ def get_pred(
                     generated_content.append(pred_token_idx.item())
                     
                     if pred_token_idx.item() in eos_token_ids:
-                        print(f"提前终止于步骤 {step} (遇到终止符)")
+                        print(f"stop at {step} ")
                         break
 
             pred = tokenizer.decode(generated_content, skip_special_tokens=True)
             pred = post_process(pred, model_name)
-            print(f"Sample {idx} Prediction: {pred}")  # 添加此行
+            print(f"Sample {idx} Prediction: {pred}")  
             print(f"Prediction: {pred[:100]}...")
             
             preds.append({
@@ -254,7 +246,7 @@ def get_pred(
             })
             
         except (TimeoutException, RuntimeError) as e:
-            print(f"处理样本{idx}时出错: {str(e)}")
+            print(f"processing {idx} error: {str(e)}")
             torch.cuda.empty_cache()
             continue
             
@@ -265,80 +257,76 @@ def get_pred(
 
 def compress_attention_weights(model, svd_rank=None):
     """
-    对模型中的注意力层权重进行SVD压缩，并保存压缩后的权重。
-    为每个投影层分配不同的svd_rank，确保svd_rank > input_svd_rank且 < 75%原始维度。
+    SVD
+    differrnt svd_rank
     """
     print("Starting SVD compression of attention weights...")
 
-    # 基础的SVD秩，可以根据需要调整
     base_svd_rank = svd_rank if svd_rank is not None else 1024  # 默认值为1024
 
     for name, module in model.named_modules():
-        # 检查模块是否包含注意力投影层
         if hasattr(module, 'q_proj') and hasattr(module, 'k_proj') and hasattr(module, 'v_proj') and hasattr(module, 'o_proj'):
             for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 weight = getattr(module, proj).weight.data
                 try:
-                    # 获取原始权重的形状
                     dim1, dim2 = weight.shape
 
-                    # 计算每个投影层的svd_rank_max，确保它小于75%原始维度
+                    # svd_rank_max
                     svd_rank_max = int(0.85 * max(dim1, dim2))
 
-                    # 根据投影类型分配不同的svd_rank
+                    # svd_rank
                     if proj in ['q_proj', 'k_proj', 'v_proj']:
-                        # 对于关键层，使用较高的svd_rank，确保保留更多信息
+                        # higher svd_rank
                         current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如2048/3072
                     elif proj == 'o_proj':
-                        # 对于o_proj，使用更高的svd_rank，确保保留更多信息
+                        # o_proj
                         current_svd_rank = min(int(base_svd_rank * 3.3), svd_rank_max)  # 例如3072
                     else:
                         current_svd_rank = min(base_svd_rank, svd_rank_max)
 
-                    # 进行SVD分解
+                    # SVD
                     weight_float = weight.float()
                     U, S, Vh = torch.linalg.svd(weight_float, full_matrices=False)
 
-                    # 计算总能量
+                    # energy
                     energy = torch.sum(S ** 2)
                     cumulative_energy = torch.cumsum(S ** 2, dim=0)
                     energy_threshold = 0.997 * energy
 
-                    # 选择rank，使得保留99%的能量
+                    # rank
                     rank_to_use = (cumulative_energy <= energy_threshold).sum().item() + 1  # +1以包含第一个超过阈值的奇异值
 
-                    # 设定压缩秩的上限
                     rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
 
-                    # 确保rank_to_use不低于基础svd_rank
+                    # rank_to_use>=base svd_rank
                     if rank_to_use < base_svd_rank:
                         rank_to_use = base_svd_rank
                         rank_to_use = min(rank_to_use, current_svd_rank, S.size(0))
 
-                    # 截断SVD分解结果
+                    # SVD result
                     U_truncated = U[:, :rank_to_use]
                     S_truncated = S[:rank_to_use]
                     Vh_truncated = Vh[:rank_to_use, :]
 
-                    # 重构压缩后的权重矩阵
+                    # reconstruction of the compressed weight matrix
                     compressed_weight = torch.mm(U_truncated, torch.diag(S_truncated)).mm(Vh_truncated)
 
-                    # 转换回原始的数据类型
+                    # conversion back to the original data type
                     compressed_weight = compressed_weight.to(weight.dtype)
 
-                    # 替换原始权重
+                    # replacement of the original weights
                     getattr(module, proj).weight.data = compressed_weight
 
-                    # 计算能量保留比例
+                    # calculation of the energy retention ratio
                     energy_retained = torch.sum(S_truncated ** 2).item() / energy.item()
 
-                    # 输出压缩信息
+                    # output of compression information
                     print(f"SVD compressed {proj} for {name}: original shape {weight.shape}, compressed shape {compressed_weight.shape}, rank={rank_to_use}, energy retained={energy_retained:.4f}")
 
                 except Exception as e:
                     print(f"Failed to compress {proj} for {name}: {e}")
 
-# 保存压缩后的权重
+# save
 def save_compressed_weights(model, model_version):
     save_dir = os.path.join("./svd_compressed", model_version)
     os.makedirs(save_dir, exist_ok=True)
@@ -348,7 +336,7 @@ def save_compressed_weights(model, model_version):
     except Exception as e:
         print(f"Failed to save compressed model weights: {e}")
 
-# 加载压缩后的权重
+# load
 def load_svd_compressed_weights(model, model_version):
     compressed_path = os.path.join("./svd_compressed", model_version, "compressed_model.pth")
     if os.path.exists(compressed_path):
@@ -381,13 +369,13 @@ def load_model_and_tokenizer(path, model_name):
     device = select_device(model_name)
     print(f"【资源分配】{model_name} → {device}")
     
-    model = AutoModelForCausalLM.from_pretrained(  # 修改加载参数
+    model = AutoModelForCausalLM.from_pretrained(  
         path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        device_map={"": device},  # 修改
-        attn_implementation="flash_attention_2" if not args.compress_svd else "eager",  # 修改点2
-        #max_memory={i: "80GiB" for i in range(torch.cuda.device_count())}, # 新增
+        device_map={"": device},  
+        attn_implementation="flash_attention_2" if not args.compress_svd else "eager",  
+        #max_memory={i: "80GiB" for i in range(torch.cuda.device_count())}, 
         low_cpu_mem_usage=True,
     )
     
@@ -433,17 +421,17 @@ def load_model_and_tokenizer(path, model_name):
         )
     else:
         enable_tuple_kv_cache(model)
-    model.config.pretraining_tp = 1  # 新增：禁用TP
+    model.config.pretraining_tp = 1  
     # 设备一致性检查
     for name, param in model.named_parameters():
         if param.device != torch.device(device):
-            raise RuntimeError(f"参数 {name} 设备不一致: {param.device}")
+            raise RuntimeError(f"param {name} device is different: {param.device}")
         
     return model, tokenizer, eos_token_ids
 
 
 if __name__ == "__main__":
-     # 在加载模型前初始化设备
+     # init
     global device
     seed_everything(42)
     args = parse_args()
@@ -458,11 +446,9 @@ if __name__ == "__main__":
     )
     #model = to_device(model, device_list, enable_tp=True)
 
-        # 如果选择加载已压缩的权重
     #if args.load_compressed:
     #    load_svd_compressed_weights(model, model_name)
 
-    # 如果选择进行 SVD 压缩
     if args.compress_svd:
         compress_attention_weights(model, svd_rank=args.svd_rank)
         save_compressed_weights(model, model_name)
@@ -503,7 +489,7 @@ if __name__ == "__main__":
             "/home/xuezeyu/llm/duo-attention/datasets/THUDM/LongBench",
             name=dataset,
             split="test",
-            num_proc=1  # NEW: 强制单线程
+            num_proc=1  # NEW
         )
         print(data)
         if not os.path.exists(f"eval/LongBench/pred/{model_name}"):
