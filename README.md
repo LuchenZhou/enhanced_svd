@@ -58,15 +58,6 @@ bash scripts/run_longbench.sh
 
 bash scripts/run_longbench_1.sh
 ```
-### Needle-in-a-Haystack (NIAH)
 
-```bash
-bash scripts/run_niah.sh
-```
-
-### Efficiency
-
-```bash
-bash scripts/run_efficiency_svd.sh
-```
-
+### More
+Contact 1020010407@qq.com
