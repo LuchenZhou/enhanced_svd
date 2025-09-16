@@ -7,8 +7,6 @@ Long context large language model inference is constrained by key value (KV) cac
 #### Environment
 
 ```bash
-conda create -yn duo python=3.10
-conda activate duo
 
 conda install -y git
 conda install -y nvidia/label/cuda-12.4.0::cuda-toolkit
