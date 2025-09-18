@@ -60,4 +60,4 @@ bash scripts/run_longbench_1.sh
 ```
 
 ### More
-Contact 1020010407@qq.com
+More details, please contact Zhouluchen23@nudt.edu.cn
