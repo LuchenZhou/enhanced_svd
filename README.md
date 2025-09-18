@@ -35,9 +35,7 @@ huggingface-cli download togethercomputer/Llama-2-7B-32K-Instruct --local-dir Ll
 huggingface-cli download gradientai/Llama-3-8B-Instruct-Gradient-1048k --local-dir Llama-3-8B-Instruct-Gradient-1048k
 ```
 **Dataset**
-```bash
-wget https://huggingface.co/datasets/togethercomputer/Long-Data-Collections/resolve/main/fine-tune/booksum.jsonl.zst
-```
+NIAH, LongBench
 
 ## Experiment
 motivation
